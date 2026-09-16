@@ -64,15 +64,25 @@ jobs:
           # Unser letztes Release lesen (kann fehlen, falls es das erste Release ist)
           our_json=$(curl -sf "${auth[@]}" "https://api.github.com/repos/${TARGET_REPO}/releases/latest" || echo '{}')
           our_tag=$(echo "$our_json" | jq -r '.tag_name // ""')
-          our_base=$(echo "$our_tag" | sed -E 's/-r[0-9]+$//')
 
-          echo "unser letztes Release: ${our_tag:-<keins>} (Basis: ${our_base:-<keine>})"
+          # Numerischen Versionskern extrahieren (z.B. "v.1.12.2-r1" -> "1.12.2"),
+          # damit ein Tippfehler im Tag-Praefix (fehlender/zusaetzlicher Punkt o.ae.)
+          # nicht als "neue odelot-Version" missverstanden wird.
+          normalize_base() {
+            echo "$1" | sed -E 's/-r[0-9]+$//' | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1
+          }
+
+          odelot_base=$(normalize_base "$odelot_tag")
+          our_base=$(normalize_base "$our_tag")
+
+          echo "unser letztes Release: ${our_tag:-<keins>} (Basis normalisiert: ${our_base:-<keine>})"
+          echo "odelot Basis normalisiert: ${odelot_base:-<keine>}"
 
           should_run=false
           if [ "$FORCE_REBUILD" = "true" ]; then
             echo "force_rebuild=true -> läuft unabhängig vom Vergleich"
             should_run=true
-          elif [ "$odelot_tag" != "$our_base" ]; then
+          elif [ -z "$odelot_base" ] || [ "$odelot_base" != "$our_base" ]; then
             should_run=true
           fi
 
