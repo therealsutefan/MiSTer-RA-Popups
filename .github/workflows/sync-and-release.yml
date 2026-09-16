@@ -1,0 +1,304 @@
+name: Sync with odelot & Release
+
+# Beobachtet github.com/odelot/Main_MiSTer auf neue Releases, rebased unsere
+# Custom-Popup-Änderungen (achievements.cpp/.h, menu.cpp/.h, scaler.cpp) darauf,
+# baut das ARM-Binary und veröffentlicht ein Release auf diesem Repo.
+#
+# Die Custom-Änderungen leben als 1+ Commits auf dem Branch `main`, oben auf
+# dem Tag `upstream-base` (zeigt auf den odelot-Commit, auf dem wir gerade
+# aufbauen). Ein neues odelot-Release => `git rebase --onto <neuer-tag>
+# upstream-base main`. Bei Konflikt wird sauber abgebrochen, nichts gepusht.
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Auch ohne neues odelot-Release laufen lassen (z. B. für Tests oder nach einem Fix an unseren Patches)'
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Merge + Build testen, aber NICHT pushen/releasen/benachrichtigen als echt markieren'
+        type: boolean
+        default: false
+
+concurrency:
+  group: mister-ra-popups-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: odelot/Main_MiSTer
+  TARGET_REPO: therealsutefan/MiSTer-RA-Popups
+
+jobs:
+  # ---------------------------------------------------------------------
+  # check: prüft ob odelot ein neues Release hat, das wir noch nicht verarbeitet haben
+  # ---------------------------------------------------------------------
+  check:
+    runs-on: ubuntu-22.04
+    outputs:
+      should_run: ${{ steps.compare.outputs.should_run }}
+      odelot_tag: ${{ steps.compare.outputs.odelot_tag }}
+      target_release_tag: ${{ steps.compare.outputs.target_release_tag }}
+      odelot_release_name: ${{ steps.compare.outputs.odelot_release_name }}
+      odelot_release_notes_b64: ${{ steps.compare.outputs.odelot_release_notes_b64 }}
+    steps:
+      - name: Compare odelot latest release vs. our latest release
+        id: compare
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+        run: |
+          set -euo pipefail
+
+          auth=(-H "Authorization: Bearer ${GH_TOKEN}")
+
+          odelot_json=$(curl -sf "${auth[@]}" "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest")
+          odelot_tag=$(echo "$odelot_json" | jq -r '.tag_name')
+          odelot_name=$(echo "$odelot_json" | jq -r '.name')
+          odelot_notes=$(echo "$odelot_json" | jq -r '.body // ""')
+
+          echo "odelot latest: $odelot_tag ($odelot_name)"
+
+          # Unser letztes Release lesen (kann fehlen, falls es das erste Release ist)
+          our_json=$(curl -sf "${auth[@]}" "https://api.github.com/repos/${TARGET_REPO}/releases/latest" || echo '{}')
+          our_tag=$(echo "$our_json" | jq -r '.tag_name // ""')
+          our_base=$(echo "$our_tag" | sed -E 's/-r[0-9]+$//')
+
+          echo "unser letztes Release: ${our_tag:-<keins>} (Basis: ${our_base:-<keine>})"
+
+          should_run=false
+          if [ "$FORCE_REBUILD" = "true" ]; then
+            echo "force_rebuild=true -> läuft unabhängig vom Vergleich"
+            should_run=true
+          elif [ "$odelot_tag" != "$our_base" ]; then
+            should_run=true
+          fi
+
+          # Freien -rN Suffix für den Ziel-Tag finden
+          n=1
+          candidate="${odelot_tag}-r${n}"
+          while curl -sf -o /dev/null "${auth[@]}" "https://api.github.com/repos/${TARGET_REPO}/releases/tags/${candidate}"; do
+            n=$((n+1))
+            candidate="${odelot_tag}-r${n}"
+          done
+
+          echo "should_run=$should_run"          >> "$GITHUB_OUTPUT"
+          echo "odelot_tag=$odelot_tag"           >> "$GITHUB_OUTPUT"
+          echo "target_release_tag=$candidate"    >> "$GITHUB_OUTPUT"
+          echo "odelot_release_name=$odelot_name" >> "$GITHUB_OUTPUT"
+          echo "odelot_release_notes_b64=$(echo -n "$odelot_notes" | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------
+  # merge: rebased unsere Custom-Commits auf den neuen odelot-Tag
+  # ---------------------------------------------------------------------
+  merge:
+    needs: check
+    if: needs.check.outputs.should_run == 'true'
+    runs-on: ubuntu-22.04
+    outputs:
+      conflict: ${{ steps.rebase.outputs.conflict }}
+      conflict_files: ${{ steps.rebase.outputs.conflict_files }}
+    steps:
+      - name: Checkout main (volle Historie)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Add odelot remote & fetch new tag
+        run: |
+          set -euo pipefail
+          git remote add odelot "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch odelot "refs/tags/${{ needs.check.outputs.odelot_tag }}:refs/tags/${{ needs.check.outputs.odelot_tag }}"
+          git config user.name "MiSTer-RA-Popups Bot"
+          git config user.email "actions@users.noreply.github.com"
+
+      - name: Rebase our customizations onto the new odelot tag
+        id: rebase
+        run: |
+          set -euo pipefail
+          NEW_TAG="${{ needs.check.outputs.odelot_tag }}"
+
+          if git rebase --onto "$NEW_TAG" upstream-base main; then
+            echo "Rebase erfolgreich."
+            git tag -f upstream-base "$NEW_TAG"
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            echo "conflict_files=" >> "$GITHUB_OUTPUT"
+          else
+            files=$(git diff --name-only --diff-filter=U | tr '\n' ',' | sed 's/,$//')
+            echo "Konflikt in: $files"
+            git rebase --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "conflict_files=$files" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push rebased main + upstream-base tag
+        if: steps.rebase.outputs.conflict == 'false' && inputs.dry_run != true
+        run: |
+          set -euo pipefail
+          git push --force origin main
+          git push --force origin upstream-base
+
+  # ---------------------------------------------------------------------
+  # build: ARM Cross-Compile im vorhandenen Devcontainer-Image
+  # ---------------------------------------------------------------------
+  build:
+    needs: [check, merge]
+    if: needs.merge.outputs.conflict == 'false'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          # Bei dry_run wurde main im merge-Job nicht gepusht -> hier
+          # trotzdem den frisch gerebasten main-Branch neu bauen, indem wir
+          # denselben Rebase-Schritt wiederholen (kein Push, nur lokal).
+          ref: main
+          fetch-depth: 0
+
+      - name: Re-apply rebase locally when dry_run (no push happened)
+        if: inputs.dry_run == true
+        run: |
+          set -euo pipefail
+          git remote add odelot "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch odelot "refs/tags/${{ needs.check.outputs.odelot_tag }}:refs/tags/${{ needs.check.outputs.odelot_tag }}"
+          git config user.name "MiSTer-RA-Popups Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git rebase --onto "${{ needs.check.outputs.odelot_tag }}" upstream-base main
+
+      - name: Build cross-compiler image (Devcontainer)
+        run: docker build -t mister-builder -f .devcontainer/Dockerfile .
+
+      - name: Compile bin/MiSTer
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD":/src -w /src mister-builder bash -c '
+            set -euo pipefail
+            export PATH="$PATH:$(echo /usr/local/bin/gcc-arm-*/bin)"
+            make
+          '
+
+      - name: Smoke-Test des Binaries
+        run: |
+          set -euo pipefail
+          test -s bin/MiSTer
+          file bin/MiSTer | grep -qi "ARM" || { echo "bin/MiSTer sieht nicht wie ein ARM-Binary aus"; exit 1; }
+          echo "OK: $(file bin/MiSTer)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiSTer-binary
+          path: bin/MiSTer
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # release: erstellt das GitHub Release mit Binary + Notes
+  # ---------------------------------------------------------------------
+  release:
+    needs: [check, merge, build]
+    if: needs.merge.outputs.conflict == 'false' && inputs.dry_run != true
+    runs-on: ubuntu-22.04
+    outputs:
+      release_url: ${{ steps.create.outputs.release_url }}
+    steps:
+      - name: Checkout (für Tag-Erstellung auf main)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: MiSTer-binary
+          path: bin
+
+      - name: Build release notes
+        id: notes
+        env:
+          ODELOT_TAG: ${{ needs.check.outputs.odelot_tag }}
+          ODELOT_NAME: ${{ needs.check.outputs.odelot_release_name }}
+          ODELOT_NOTES_B64: ${{ needs.check.outputs.odelot_release_notes_b64 }}
+        run: |
+          set -euo pipefail
+          odelot_notes=$(echo "$ODELOT_NOTES_B64" | base64 -d)
+          {
+            echo "Community-Build von [odelot/Main_MiSTer](https://github.com/${UPSTREAM_REPO}) **${ODELOT_TAG}** (${ODELOT_NAME}),"
+            echo "mit unseren RetroAchievements-Popup-Verbesserungen (Word-Wrap, Punkte-Anzeige,"
+            echo "Challenge-Tags, Progress-Indicator, per-Core Popup-Positionierung)."
+            echo ""
+            echo "### odelot Release-Notes (${ODELOT_TAG})"
+            echo "$odelot_notes"
+          } > release_notes.md
+          cat release_notes.md
+
+      - name: Create GitHub Release
+        id: create
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TAG: ${{ needs.check.outputs.target_release_tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            bin/MiSTer \
+            --repo "${TARGET_REPO}" \
+            --target main \
+            --title "$TAG" \
+            --notes-file release_notes.md
+          url=$(gh release view "$TAG" --repo "${TARGET_REPO}" --json url -q .url)
+          echo "release_url=$url" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------
+  # notify: Telegram-Benachrichtigung (Erfolg oder Konflikt/Fehler)
+  # ---------------------------------------------------------------------
+  notify:
+    needs: [check, merge, build, release]
+    if: always() && needs.check.outputs.should_run == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Send Telegram notification
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MERGE_RESULT: ${{ needs.merge.result }}
+          MERGE_CONFLICT: ${{ needs.merge.outputs.conflict }}
+          CONFLICT_FILES: ${{ needs.merge.outputs.conflict_files }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          RELEASE_URL: ${{ needs.release.outputs.release_url }}
+          ODELOT_TAG: ${{ needs.check.outputs.odelot_tag }}
+          TARGET_TAG: ${{ needs.check.outputs.target_release_tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          send() {
+            payload=$(jq -n --arg chat_id "$CHAT_ID" --arg text "$1" '{chat_id: $chat_id, text: $text, parse_mode: "HTML", disable_web_page_preview: true}')
+            curl -sf -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" -H "Content-Type: application/json" -d "$payload" > /dev/null
+          }
+
+          prefix=""
+          if [ "$DRY_RUN" = "true" ]; then prefix="[DRY RUN] "; fi
+
+          if [ "$MERGE_RESULT" = "success" ] && [ "$MERGE_CONFLICT" = "false" ] && [ "$BUILD_RESULT" = "success" ] && [ "$RELEASE_RESULT" = "success" ]; then
+            msg=$(printf '%s\xE2\x9C\x85 <b>MiSTer-RA-Popups %s</b> veroeffentlicht (odelot %s).\nRelease: %s' "$prefix" "$TARGET_TAG" "$ODELOT_TAG" "$RELEASE_URL")
+            send "$msg"
+
+            discord_text=$(printf '**MiSTer-RA-Popups %s** ist da!\nBasiert auf odelot/Main_MiSTer %s, mit RetroAchievements-Popup-Verbesserungen (Word-Wrap, Punkte-Anzeige, Challenge-Tags, Progress-Indicator, per-Core Positionierung).\nDownload: %s' "$TARGET_TAG" "$ODELOT_TAG" "$RELEASE_URL")
+            forum_text=$(printf '[b]MiSTer-RA-Popups %s[/b]\nCommunity-Build auf Basis von odelots Main_MiSTer %s mit erweiterten RetroAchievements-Popups (Word-Wrap, Punkte-Anzeige [+X], Challenge-Start/-Miss-Tags, Fortschrittsanzeige, pro-Core einstellbare Popup-Position).\nDownload: %s' "$TARGET_TAG" "$ODELOT_TAG" "$RELEASE_URL")
+            copy_msg=$(printf '%s\xF0\x9F\x93\x8B <b>Zum Copy-Paste</b>\n\n<b>Discord:</b>\n<pre>%s</pre>\n\n<b>Forum (misterfpga.org):</b>\n<pre>%s</pre>' "$prefix" "$discord_text" "$forum_text")
+            send "$copy_msg"
+
+          elif [ "$MERGE_CONFLICT" = "true" ]; then
+            msg=$(printf '%s\xE2\x9A\xA0\xEF\xB8\x8F <b>Merge-Konflikt</b> beim Rebase auf odelot %s.\nBetroffene Dateien: <code>%s</code>\nBitte manuell aufloesen (git rebase --onto %s upstream-base main) und wieder pushen.\nRun: %s' "$prefix" "$ODELOT_TAG" "$CONFLICT_FILES" "$ODELOT_TAG" "$RUN_URL")
+            send "$msg"
+
+          else
+            msg=$(printf '%s\xE2\x9D\x8C <b>Workflow fehlgeschlagen</b> (odelot %s).\nmerge=%s build=%s release=%s\nRun: %s' "$prefix" "$ODELOT_TAG" "$MERGE_RESULT" "$BUILD_RESULT" "$RELEASE_RESULT" "$RUN_URL")
+            send "$msg"
+          fi
