@@ -144,6 +144,8 @@ enum MENU
 	MENU_RA_ACHIEVEMENTS2,
 	MENU_RA_ACH_DETAIL1,
 	MENU_RA_ACH_DETAIL2,
+	MENU_RA_SETTINGS1,
+	MENU_RA_SETTINGS2,
 
 	MENU_UART1,
 	MENU_UART2,
@@ -4094,7 +4096,7 @@ void HandleUI(void)
 	case MENU_MISC1:
 		OsdSetSize(16);
 		helptext_idx = 0;
-		menumask = 0xF;
+		menumask = 0x1F;
 		menustate = MENU_MISC2;
 		sysinfo_timer = 0; // force refresh
 		OsdSetTitle("Misc. Options", OSD_ARROW_RIGHT);
@@ -4105,7 +4107,7 @@ void HandleUI(void)
 			flag = 1;
 			for (int i = 1; i < 4; i++) if (FileExists(cfg_get_name(i))) flag |= 1 << i;
 			flag |= altcfg() << 4;
-			menusub = 3;
+			menusub = 4;
 		}
 		parentstate = MENU_MISC1;
 
@@ -4158,14 +4160,21 @@ void HandleUI(void)
 		}
 		OsdWrite(13, s, menusub == 2);
 
-		OsdWrite(15, STD_EXIT, menusub == 3, 0, OSD_ARROW_RIGHT);
+		OsdWrite(14, " RA Settings               \x16", menusub == 3);
+		OsdWrite(15, STD_EXIT, menusub == 4, 0, OSD_ARROW_RIGHT);
 		break;
 
 	case MENU_MISC2:
 		printSysInfo();
-		if ((select && menusub == 3) || menu)
+		if ((select && menusub == 4) || menu)
 		{
 			menustate = MENU_NONE1;
+			break;
+		}
+		else if (select && menusub == 3)
+		{
+			menusub = 0;
+			menustate = MENU_RA_SETTINGS1;
 			break;
 		}
 		else if (menusub == 0 && (right || left || minus || plus || select))
@@ -5842,6 +5851,112 @@ void HandleUI(void)
 		if (menu || back)
 		{
 			menustate = MENU_RA_ACHIEVEMENTS1;
+		}
+		break;
+
+		/******************************************************************/
+		/* RetroAchievements settings                                       */
+		/******************************************************************/
+	case MENU_RA_SETTINGS1:
+		OsdSetSize(16);
+		helptext_idx = 0;
+		menumask = 0x1FFF; // rows 0-11 (settings) + 12 (Back)
+		parentstate = MENU_RA_SETTINGS1;
+		OsdSetTitle("RA Settings", OSD_ARROW_LEFT);
+
+		OsdWrite(0, "            Popups");
+		sprintf(s, " Challenge Start Popup: %s", achievements_get_challenge_show() ? "On" : "Off");
+		OsdWrite(1, s, menusub == 0);
+		sprintf(s, " Challenge End Popup: %s", achievements_get_challenge_hide() ? "On" : "Off");
+		OsdWrite(2, s, menusub == 1);
+		sprintf(s, " Progress Popups: %s", achievements_get_progress_popups() ? "On" : "Off");
+		OsdWrite(3, s, menusub == 2);
+		sprintf(s, " Progress Popup Name: %s", achievements_get_progress_name() ? "On" : "Off");
+		OsdWrite(4, s, menusub == 3);
+		sprintf(s, " Leaderboard Updates: %s", achievements_get_lb_updates() ? "On" : "Off");
+		OsdWrite(5, s, menusub == 4);
+		sprintf(s, " Leaderboard Submission: %s", achievements_get_lb_submission() ? "On" : "Off");
+		OsdWrite(6, s, menusub == 5);
+		sprintf(s, " Multiline Description: %s", achievements_get_multiline_desc() ? "On" : "Off");
+		OsdWrite(7, s, menusub == 6);
+		sprintf(s, " Popup Position: %s", (achievements_get_popup_pos() == INFO_ALIGN_CENTER) ? "Center" : (achievements_get_popup_pos() == INFO_ALIGN_RIGHT) ? "Right" : "Left");
+		OsdWrite(8, s, menusub == 7);
+		sprintf(s, " H-Offset: %+d", achievements_get_popup_h_offset());
+		OsdWrite(9, s, menusub == 8);
+		sprintf(s, " V-Offset: %+d", achievements_get_popup_v_offset());
+		OsdWrite(10, s, menusub == 9);
+
+		OsdWrite(11, "");
+		OsdWrite(12, "             List");
+		sprintf(s, " List Description Ticker: %s", achievements_get_desc_ticker() ? "On" : "Off");
+		OsdWrite(13, s, menusub == 10);
+		sprintf(s, " List Hotkey (Menu+Y): %s", achievements_get_list_hotkey() ? "On" : "Off");
+		OsdWrite(14, s, menusub == 11);
+
+		OsdWrite(15, STD_EXIT, menusub == 12, 0, OSD_ARROW_LEFT);
+
+		menustate = MENU_RA_SETTINGS2;
+		break;
+
+	case MENU_RA_SETTINGS2:
+		if (menu || (select && menusub == 12))
+		{
+			achievements_flush_popup_offsets();
+			menustate = MENU_MISC1;
+			menusub = 3;
+			break;
+		}
+
+		// Popup Position is a 3-way enum, cycled with Left/Right instead of toggled.
+		if (menusub == 7 && (left || right))
+		{
+			int pos = achievements_get_popup_pos() + (right ? 1 : -1);
+			if (pos < INFO_ALIGN_LEFT) pos = INFO_ALIGN_RIGHT;
+			if (pos > INFO_ALIGN_RIGHT) pos = INFO_ALIGN_LEFT;
+			achievements_set_popup_pos(pos);
+			menustate = MENU_RA_SETTINGS1;
+			break;
+		}
+
+		// H-Offset / V-Offset: live-adjust only, no write per keypress -- the
+		// dirty value is flushed once when the settings page is actually left.
+		if (menusub == 8 && (left || right))
+		{
+			achievements_set_popup_h_offset_live(achievements_get_popup_h_offset() + (right ? 10 : -10));
+			menustate = MENU_RA_SETTINGS1;
+			break;
+		}
+		if (menusub == 9 && (left || right))
+		{
+			achievements_set_popup_v_offset_live(achievements_get_popup_v_offset() + (right ? 1 : -1));
+			menustate = MENU_RA_SETTINGS1;
+			break;
+		}
+
+		if (select)
+		{
+			switch (menusub)
+			{
+			case 0: achievements_set_challenge_show(!achievements_get_challenge_show()); break;
+			case 1: achievements_set_challenge_hide(!achievements_get_challenge_hide()); break;
+			case 2: achievements_set_progress_popups(!achievements_get_progress_popups()); break;
+			case 3: achievements_set_progress_name(!achievements_get_progress_name()); break;
+			case 4: achievements_set_lb_updates(!achievements_get_lb_updates()); break;
+			case 5: achievements_set_lb_submission(!achievements_get_lb_submission()); break;
+			case 6: achievements_set_multiline_desc(!achievements_get_multiline_desc()); break;
+			case 7: achievements_set_popup_pos((achievements_get_popup_pos() + 1) % 3); break;
+			case 10: achievements_set_desc_ticker(!achievements_get_desc_ticker()); break;
+			case 11: achievements_set_list_hotkey(!achievements_get_list_hotkey()); break;
+			}
+			menustate = MENU_RA_SETTINGS1;
+			break;
+		}
+
+		if (left)
+		{
+			achievements_flush_popup_offsets();
+			menustate = MENU_MISC1;
+			menusub = 3;
 		}
 		break;
 
@@ -8220,19 +8335,23 @@ void Info(const char *message, int timeout, int width, int height, int frame)
 #define INFO_SPAN   512
 #define INFO_MARGIN 20
 
-void InfoAligned(const char *message, int timeout, int align, int frame)
+void InfoAligned(const char *message, int timeout, int align, int frame, int h_offset, int v_offset)
 {
 	if (menustate <= MENU_INFO)
 	{
 		int width = 0, height = 0;
 		OSD_PrintInfo(message, &width, &height, frame);
 
-		int x = INFO_MARGIN;
+		int x = INFO_MARGIN + h_offset;
 		if (align == INFO_ALIGN_CENTER) x = (INFO_SPAN - (width * 8)) / 2;
-		else if (align == INFO_ALIGN_RIGHT) x = INFO_SPAN - (width * 8) - INFO_MARGIN;
+		else if (align == INFO_ALIGN_RIGHT) x = INFO_SPAN - (width * 8) - INFO_MARGIN - h_offset;
 		if (x < 0) x = 0;
+		if (x > INFO_SPAN - (width * 8)) x = INFO_SPAN - (width * 8);
 
-		InfoEnable(x, (cfg.direct_video && get_vga_fb()) ? 30 : 10, width, height);
+		int y = ((cfg.direct_video && get_vga_fb()) ? 30 : 10) + v_offset;
+		if (y < 0) y = 0;
+
+		InfoEnable(x, y, width, height);
 		OsdSetSize(16);
 
 		menu_timer = GetTimer(timeout);

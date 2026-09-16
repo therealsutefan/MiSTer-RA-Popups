@@ -25,7 +25,7 @@ void InfoAt(const char *message, int timeout = 2000, int y_pos = 10, int frame =
 // top row instead of always hugging the left edge. Used by the RetroAchievements
 // popups (retroachievements.cfg: popup_position) so they stay visible when the
 // display crops the sides (e.g. HDMI forced to 4:3 on a TV).
-void InfoAligned(const char *message, int timeout = 2000, int align = INFO_ALIGN_LEFT, int frame = 0);
+void InfoAligned(const char *message, int timeout = 2000, int align = INFO_ALIGN_LEFT, int frame = 0, int h_offset = 0, int v_offset = 0);
 void MenuHide();
 void SelectINI();
 
