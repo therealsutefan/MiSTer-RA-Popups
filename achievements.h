@@ -98,6 +98,40 @@ int achievements_desc_ticker_enabled(void);
 // 1 = in-game Menu+Y gamepad shortcut to the list enabled (retroachievements.cfg: list_hotkey)
 int achievements_list_hotkey_enabled(void);
 
+// --- RA Settings menu: live setters + getters (retroachievements.cfg) ------
+// Each setter updates the running g_* state and persists the key immediately
+// (no re-init/reboot required). Each getter returns the current live value
+// for the menu to display.
+void achievements_set_challenge_show(int on);
+void achievements_set_challenge_hide(int on);
+void achievements_set_progress_popups(int on);
+void achievements_set_progress_name(int on);
+void achievements_set_lb_updates(int on);
+void achievements_set_lb_submission(int on);
+void achievements_set_multiline_desc(int on);
+void achievements_set_desc_ticker(int on);
+void achievements_set_list_hotkey(int on);
+void achievements_set_popup_pos(int pos); // INFO_ALIGN_LEFT/_CENTER/_RIGHT (0/1/2)
+
+int achievements_get_challenge_show(void);
+int achievements_get_challenge_hide(void);
+int achievements_get_progress_popups(void);
+int achievements_get_progress_name(void);
+int achievements_get_lb_updates(void);
+int achievements_get_lb_submission(void);
+int achievements_get_multiline_desc(void);
+int achievements_get_desc_ticker(void);
+int achievements_get_list_hotkey(void);
+int achievements_get_popup_pos(void);
+
+// Popup H/V offset: live-set (no write per keypress) + debounced flush.
+// Range clamp happens inside the setter (H: +/-80, V: +/-10).
+void achievements_set_popup_h_offset_live(int v);
+void achievements_set_popup_v_offset_live(int v);
+void achievements_flush_popup_offsets(void);
+int achievements_get_popup_h_offset(void);
+int achievements_get_popup_v_offset(void);
+
 // Returns the total count in the currently open list (0 if not open).
 int achievements_list_count(void);
 
