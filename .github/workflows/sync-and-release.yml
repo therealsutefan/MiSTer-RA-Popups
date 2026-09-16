@@ -11,7 +11,10 @@ name: Sync with odelot & Release
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    # :17 statt :00 -- GitHub warnt, dass Schedule-Runs zur vollen Stunde
+    # (Hochlast-Fenster) eher verzoegert werden. Verringert das Risiko,
+    # eliminiert es aber nicht (siehe README: "Automated Releases").
+    - cron: '17 */6 * * *'
   workflow_dispatch:
     inputs:
       force_rebuild:
