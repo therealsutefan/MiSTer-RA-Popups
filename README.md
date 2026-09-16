@@ -411,6 +411,12 @@ make
 
 The Makefile automatically detects the rcheevos library and enables it if present.
 
+## Automated Releases
+
+This fork's binaries are built and published automatically by [`.github/workflows/sync-and-release.yml`](.github/workflows/sync-and-release.yml). On a schedule (currently every 6 hours), it checks whether [odelot/Main_MiSTer](https://github.com/odelot/Main_MiSTer) has published a release we haven't rebased onto yet, and if so, rebases our customizations on top, builds, and publishes a new `vX.Y.Z-rN` release here.
+
+**Known limitation:** GitHub documents that [scheduled workflow runs can be delayed](https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule) during periods of high load on GitHub's infrastructure, especially around the top of the hour. This is expected, platform-side behavior we can't fully control — the workflow's cron minute is offset (`17 */6 * * *`, i.e. :17 past the hour) specifically to reduce (not eliminate) the chance of landing in that high-load window. A run may still occasionally fire later than the nominal 6h interval; this is not a bug in the workflow itself.
+
 ## Links
 
 - Original MiSTer Main binary: [MiSTer-devel/Main_MiSTer](https://github.com/MiSTer-devel/Main_MiSTer)
