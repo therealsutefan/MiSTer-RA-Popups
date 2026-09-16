@@ -102,7 +102,7 @@ jobs:
       conflict_files: ${{ steps.rebase.outputs.conflict_files }}
     steps:
       - name: Checkout main (volle Historie)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
@@ -151,7 +151,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout main
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Bei dry_run wurde main im merge-Job nicht gepusht -> hier
           # trotzdem den frisch gerebasten main-Branch neu bauen, indem wir
@@ -189,7 +189,7 @@ jobs:
           echo "OK: $(file bin/MiSTer)"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: MiSTer-binary
           path: bin/MiSTer
@@ -206,13 +206,13 @@ jobs:
       release_url: ${{ steps.create.outputs.release_url }}
     steps:
       - name: Checkout (für Tag-Erstellung auf main)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: main
           token: ${{ secrets.RELEASE_TOKEN }}
 
       - name: Download artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: MiSTer-binary
           path: bin
@@ -285,14 +285,30 @@ jobs:
           prefix=""
           if [ "$DRY_RUN" = "true" ]; then prefix="[DRY RUN] "; fi
 
-          if [ "$MERGE_RESULT" = "success" ] && [ "$MERGE_CONFLICT" = "false" ] && [ "$BUILD_RESULT" = "success" ] && [ "$RELEASE_RESULT" = "success" ]; then
-            msg=$(printf '%s\xE2\x9C\x85 <b>MiSTer-RA-Popups %s</b> veroeffentlicht (odelot %s).\nRelease: %s' "$prefix" "$TARGET_TAG" "$ODELOT_TAG" "$RELEASE_URL")
-            send "$msg"
+          # release wird im dry_run absichtlich übersprungen (job-if greift) --
+          # das zählt als "ok", nicht als Fehler. Ein "skipped" release bei
+          # einem echten Lauf (dry_run=false) ist dagegen unerwartet -> Fehler.
+          release_ok=false
+          if [ "$RELEASE_RESULT" = "success" ]; then
+            release_ok=true
+          elif [ "$RELEASE_RESULT" = "skipped" ] && [ "$DRY_RUN" = "true" ]; then
+            release_ok=true
+          fi
 
-            discord_text=$(printf '**MiSTer-RA-Popups %s** ist da!\nBasiert auf odelot/Main_MiSTer %s, mit RetroAchievements-Popup-Verbesserungen (Word-Wrap, Punkte-Anzeige, Challenge-Tags, Progress-Indicator, per-Core Positionierung).\nDownload: %s' "$TARGET_TAG" "$ODELOT_TAG" "$RELEASE_URL")
-            forum_text=$(printf '[b]MiSTer-RA-Popups %s[/b]\nCommunity-Build auf Basis von odelots Main_MiSTer %s mit erweiterten RetroAchievements-Popups (Word-Wrap, Punkte-Anzeige [+X], Challenge-Start/-Miss-Tags, Fortschrittsanzeige, pro-Core einstellbare Popup-Position).\nDownload: %s' "$TARGET_TAG" "$ODELOT_TAG" "$RELEASE_URL")
-            copy_msg=$(printf '%s\xF0\x9F\x93\x8B <b>Zum Copy-Paste</b>\n\n<b>Discord:</b>\n<pre>%s</pre>\n\n<b>Forum (misterfpga.org):</b>\n<pre>%s</pre>' "$prefix" "$discord_text" "$forum_text")
-            send "$copy_msg"
+          if [ "$MERGE_RESULT" = "success" ] && [ "$MERGE_CONFLICT" = "false" ] && [ "$BUILD_RESULT" = "success" ] && [ "$release_ok" = "true" ]; then
+
+            if [ "$RELEASE_RESULT" = "success" ]; then
+              msg=$(printf '%s\xE2\x9C\x85 <b>MiSTer-RA-Popups %s</b> veroeffentlicht (odelot %s).\nRelease: %s' "$prefix" "$TARGET_TAG" "$ODELOT_TAG" "$RELEASE_URL")
+              send "$msg"
+
+              discord_text=$(printf '**MiSTer-RA-Popups %s** ist da!\nBasiert auf odelot/Main_MiSTer %s, mit RetroAchievements-Popup-Verbesserungen (Word-Wrap, Punkte-Anzeige, Challenge-Tags, Progress-Indicator, per-Core Positionierung).\nDownload: %s' "$TARGET_TAG" "$ODELOT_TAG" "$RELEASE_URL")
+              forum_text=$(printf '[b]MiSTer-RA-Popups %s[/b]\nCommunity-Build auf Basis von odelots Main_MiSTer %s mit erweiterten RetroAchievements-Popups (Word-Wrap, Punkte-Anzeige [+X], Challenge-Start/-Miss-Tags, Fortschrittsanzeige, pro-Core einstellbare Popup-Position).\nDownload: %s' "$TARGET_TAG" "$ODELOT_TAG" "$RELEASE_URL")
+              copy_msg=$(printf '%s\xF0\x9F\x93\x8B <b>Zum Copy-Paste</b>\n\n<b>Discord:</b>\n<pre>%s</pre>\n\n<b>Forum (misterfpga.org):</b>\n<pre>%s</pre>' "$prefix" "$discord_text" "$forum_text")
+              send "$copy_msg"
+            else
+              msg=$(printf '%s\xE2\x9C\x85 Merge + Build erfolgreich (odelot %s). Release bewusst uebersprungen (dry_run) -- kein echter Download-Link.' "$prefix" "$ODELOT_TAG")
+              send "$msg"
+            fi
 
           elif [ "$MERGE_CONFLICT" = "true" ]; then
             msg=$(printf '%s\xE2\x9A\xA0\xEF\xB8\x8F <b>Merge-Konflikt</b> beim Rebase auf odelot %s.\nBetroffene Dateien: <code>%s</code>\nBitte manuell aufloesen (git rebase --onto %s upstream-base main) und wieder pushen.\nRun: %s' "$prefix" "$ODELOT_TAG" "$CONFLICT_FILES" "$ODELOT_TAG" "$RUN_URL")
