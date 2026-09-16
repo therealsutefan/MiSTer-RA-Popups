@@ -286,7 +286,7 @@ int mister_scaler_read(mister_scaler *ms, unsigned char *gbuf, mister_scaler_for
 #else
 
 // no NEON available, do all scalar
-int mister_scaler_read(mister_scaler *ms, unsigned char *gbuf, mister_scaler_format_t format = RGB)
+int mister_scaler_read(mister_scaler *ms, unsigned char *gbuf, mister_scaler_format_t format)
 {
     #ifdef PROFILING
         PROFILE_FUNCTION();
@@ -337,7 +337,7 @@ int mister_scaler_read(mister_scaler *ms, unsigned char *gbuf, mister_scaler_for
                 }
                 break;
             case ARGB32:
-            for (int x = limit; x < ms->width; x++) {
+                for (int x = 0; x < ms->width; x++) {
             #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
                 outbuf[x * 4 + 0] = pixbuf[x * 3 + 2]; // B
                 outbuf[x * 4 + 1] = pixbuf[x * 3 + 1]; // G
@@ -416,7 +416,7 @@ bool write_screenshot(const char *filename, const uint8_t *argb,
 static std::atomic<bool> screenshot_pending_atomic{false};
 static std::atomic<ScreenshotResult_atomic*> screenshot_result_data_atomic{nullptr};
 
-static struct { const char *fmtstr; Imlib_Load_Error errno; } err_strings[] = {
+static struct { const char *fmtstr; Imlib_Load_Error errcode; } err_strings[] = {
   {"file '%s' does not exist", IMLIB_LOAD_ERROR_FILE_DOES_NOT_EXIST},
   {"file '%s' is a directory", IMLIB_LOAD_ERROR_FILE_IS_DIRECTORY},
   {"permission denied to read file '%s'", IMLIB_LOAD_ERROR_PERMISSION_DENIED_TO_READ},
@@ -434,7 +434,7 @@ static struct { const char *fmtstr; Imlib_Load_Error errno; } err_strings[] = {
 static void print_imlib_load_error (Imlib_Load_Error err, const char *filepath) {
   int i;
   for (i = 0; err_strings[i].fmtstr != NULL; i++) {
-    if (err == err_strings[i].errno) {
+    if (err == err_strings[i].errcode) {
 	printf("Screenshot Error (%d): ",err);
 	printf(err_strings[i].fmtstr,filepath);
 	printf("\n");
