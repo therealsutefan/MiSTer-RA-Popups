@@ -372,6 +372,8 @@ static int g_justifier_test            = 0;  // 1 = MegaDrive only: cap rtquery 
 static int g_desc_ticker               = 0;  // 1 = scroll the selected achievement's description on a ticker row in the list view (retroachievements.cfg: list_desc_ticker)
 static int g_list_hotkey               = 0;  // 1 = in-game gamepad shortcut (Menu + Y) opens the achievement list (retroachievements.cfg: list_hotkey)
 static int g_popup_pos                 = INFO_ALIGN_LEFT; // popup corner: left (default) / center / right (retroachievements.cfg: popup_position)
+static int g_popup_h_offset            = 0; // extra inward step-offset for left/right popup placement (retroachievements.cfg: popup_h_offset)
+static int g_popup_v_offset            = 0; // vertical popup offset, additive to the default row (retroachievements.cfg: popup_v_offset)
 
 // Debug watch list (retroachievements.cfg: watch=19807d,19795a — RA addresses
 // in hex). Handlers log every value change of these addresses per frame.
@@ -394,7 +396,7 @@ struct ra_ach_state_t {
 static ra_ach_state_t g_ach_state[RA_ACH_STATE_MAX];
 static int g_ach_state_count = 0;
 
-#define CHALLENGE_POPUP_COOLDOWN_SEC  10  // suppress CHALLENGE SHOW popup if one was shown < 10s ago
+#define CHALLENGE_POPUP_COOLDOWN_SEC  15  // suppress CHALLENGE SHOW popup if one was shown < 10s ago
 #define PROGRESS_SAME_VAL_COOLDOWN_SEC 5  // suppress PROGRESS popup if same value shown < 5s ago
 
 static ra_ach_state_t *ra_ach_state_get(uint32_t id)
@@ -546,7 +548,7 @@ static void ra_notify(const char *text, int duration_ms = 3000)
 
 static void ra_notify_progress(const char *text)
 {
-	ra_notify_instant(text, 2500);
+	ra_notify_instant(text, 1000);
 }
 
 // Drive OSD display — called every achievements_poll() tick
@@ -564,7 +566,7 @@ static void ra_osd_poll(void)
 	if (!s_urgent_showing && s_urgent_head != s_urgent_tail) {
 		ra_notif *n = &s_urgent_queue[s_urgent_tail % NOTIF_QUEUE_CAP];
 		s_urgent_tail++;
-		InfoAligned(n->text, n->duration_ms + 500, g_popup_pos, 1);
+		InfoAligned(n->text, n->duration_ms + 500, g_popup_pos, 1, g_popup_h_offset, g_popup_v_offset);
 		if (n->play_sound) ra_play_achievement_sound();
 		s_urgent_timer    = GetTimer(n->duration_ms);
 		s_urgent_showing  = 1;
@@ -579,7 +581,7 @@ static void ra_osd_poll(void)
 	if (s_instant_pending) {
 		s_instant_pending = 0;
 		if (!s_urgent_showing) {
-			InfoAligned(s_instant_text, s_instant_duration_ms + 500, g_popup_pos, 1);
+			InfoAligned(s_instant_text, s_instant_duration_ms + 500, g_popup_pos, 1, g_popup_h_offset, g_popup_v_offset);
 			s_instant_timer   = GetTimer(s_instant_duration_ms);
 			s_instant_showing = 1;
 			RA_LOG("OSD: Showing instant notification (%dms)", s_instant_duration_ms);
@@ -704,6 +706,283 @@ static const char *ra_popup_pos_name(int pos)
 	return (pos == INFO_ALIGN_CENTER) ? "center" : (pos == INFO_ALIGN_RIGHT) ? "right" : "left";
 }
 
+// Core-specific section header, e.g. "[SNES]" or "[N64]" — analogous to
+// MiSTer.ini's [CORE] sections (cfg.cpp: ini_get_section). Keys before the
+// first such header are global and always apply; keys inside a "[NAME]"
+// section only apply while NAME matches the active core (user_io_get_core_name(1),
+// e.g. "SNES", "N64") and override whatever the global block already set,
+// since the section is parsed after the globals in file order.
+static int ra_cfg_section_matches(const char *line, const char *core_name)
+{
+	size_t len = strlen(line);
+	if (len < 2 || line[0] != '[' || line[len - 1] != ']') return -1; // not a section header
+
+	char name[64];
+	size_t n = len - 2;
+	if (n >= sizeof(name)) n = sizeof(name) - 1;
+	memcpy(name, line + 1, n);
+	name[n] = '\0';
+
+	return (core_name && core_name[0] && !strcasecmp(name, core_name)) ? 1 : 0;
+}
+
+// Schreibt GENAU einen key=value in die cfg zurück.
+//  - vorhandene Zeile (key case-insensitive) wird ersetzt
+//  - Kommentare (#...) und alle übrigen Zeilen bleiben 1:1 erhalten
+//  - fehlender key wird angehängt
+//  - atomar: .tmp schreiben, fsync, rename() über das Original
+static int ra_save_config_kv(const char *key, const char *value)
+{
+	char tmp[256];
+	snprintf(tmp, sizeof(tmp), "%s.tmp", RA_CFG_PATH);
+
+	FILE *out = fopen(tmp, "w");
+	if (!out) { RA_LOG("ra_save: cannot open %s for write", tmp); return 0; }
+
+	FILE *in = fopen(RA_CFG_PATH, "r");   // darf fehlen -> nur Append
+	int replaced    = 0;
+	int last_had_nl = 1;
+
+	if (in) {
+		char line[512];
+		while (fgets(line, sizeof(line), in)) {
+			char work[512];
+			snprintf(work, sizeof(work), "%s", line);
+			char *nl = strpbrk(work, "\r\n"); if (nl) *nl = '\0';
+
+			char *p = work; while (*p == ' ' || *p == '\t') p++;
+			char *eq = strchr(p, '=');
+			if (p[0] != '#' && p[0] != '\0' && eq) {
+				*eq = '\0';
+				if (!strcasecmp(p, key)) {
+					fprintf(out, "%s=%s\n", key, value);
+					replaced = 1; last_had_nl = 1;
+					continue;
+				}
+			}
+			fputs(line, out);
+			size_t len = strlen(line);
+			last_had_nl = (len && line[len - 1] == '\n');
+		}
+		fclose(in);
+	}
+
+	if (!replaced) {
+		if (!last_had_nl) fputc('\n', out);
+		fprintf(out, "%s=%s\n", key, value);
+	}
+
+	fflush(out);
+	fsync(fileno(out));
+	fclose(out);
+
+	if (rename(tmp, RA_CFG_PATH) != 0) {
+		RA_LOG("ra_save: rename %s -> %s failed", tmp, RA_CFG_PATH);
+		remove(tmp);
+		return 0;
+	}
+	RA_LOG("ra_save: %s=%s", key, value);
+	return 1;
+}
+
+// --- Bool-Toggles: g_* direkt setzen + persistieren --------------------------
+void achievements_set_challenge_show(int on) { g_show_challenge_show_popup = !!on; ra_save_config_kv("show_challenge_show_popup", on ? "1" : "0"); }
+void achievements_set_challenge_hide(int on) { g_show_challenge_hide_popup = !!on; ra_save_config_kv("show_challenge_hide_popup", on ? "1" : "0"); }
+void achievements_set_progress_popups(int on){ g_show_progress_popups     = !!on; ra_save_config_kv("show_progress_popups",     on ? "1" : "0"); }
+void achievements_set_progress_name(int on)  { g_show_progress_name       = !!on; ra_save_config_kv("show_progress_name",       on ? "1" : "0"); }
+void achievements_set_lb_updates(int on)     { g_show_leaderboards_updates= !!on; ra_save_config_kv("show_leaderboards_updates", on ? "1" : "0"); }
+void achievements_set_lb_submission(int on)  { g_show_leaderboards_submission = !!on; ra_save_config_kv("show_leaderboards_submission", on ? "1" : "0"); }
+void achievements_set_multiline_desc(int on) { g_multiline_desc           = !!on; ra_save_config_kv("multiline_desc",           on ? "1" : "0"); }
+void achievements_set_desc_ticker(int on)    { g_desc_ticker              = !!on; ra_save_config_kv("list_desc_ticker",         on ? "1" : "0"); }
+void achievements_set_list_hotkey(int on)    { g_list_hotkey              = !!on; ra_save_config_kv("list_hotkey",              on ? "1" : "0"); }
+
+// --- Getter fürs Menü (Ist-Zustand anzeigen) --------------------------------
+int achievements_get_challenge_show(void) { return g_show_challenge_show_popup; }
+int achievements_get_challenge_hide(void) { return g_show_challenge_hide_popup; }
+int achievements_get_progress_popups(void){ return g_show_progress_popups; }
+int achievements_get_progress_name(void)  { return g_show_progress_name; }
+int achievements_get_lb_updates(void)     { return g_show_leaderboards_updates; }
+int achievements_get_lb_submission(void)  { return g_show_leaderboards_submission; }
+int achievements_get_multiline_desc(void) { return g_multiline_desc; }
+int achievements_get_desc_ticker(void)    { return g_desc_ticker; }
+int achievements_get_list_hotkey(void)    { return g_list_hotkey; }
+int achievements_get_popup_pos(void)      { return g_popup_pos; }
+
+// ============================================================================
+//  RA Settings – Offset-Adjuster + section-aware Persistenz
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+//  Sektionsname des aktuell laufenden Cores für die Popup-Placement-Keys,
+//  z.B. "SNES" oder "N64" -- identisch zu dem, was ra_load_popup_settings()
+//  beim Lesen an ra_cfg_section_matches() übergibt (dort: core_name direkt,
+//  ohne Prefix, aus user_io_get_core_name(1)). Beide Seiten rufen diesen
+//  Helper, damit Lese- und Schreibsektion konstruktionsbedingt nicht
+//  auseinanderlaufen können.
+//  out leer ("") => kein Core aktiv => Aufrufer schreibt global.
+static void ra_current_popup_section(char *out, size_t n)
+{
+	const char *core_name = user_io_get_core_name(1);
+	if (core_name && core_name[0]) snprintf(out, n, "%s", core_name);
+	else out[0] = '\0';
+}
+
+// ----------------------------------------------------------------------------
+//  Section-aware Writer: key=value in [section] schreiben.
+//   section == NULL/"" -> globaler Bereich (vor der ersten [..]-Zeile)
+//   section != NULL    -> in [section]; fehlt sie, wird sie am Dateiende angelegt
+//  Ersetzt den key NUR in der Zielsektion; andere Sektionen/Kommentare/Zeilen
+//  bleiben 1:1. Trailing-Leerzeilen einer Sektion bleiben als Trenner erhalten.
+//  Atomar: temp + fsync + rename.
+static int ra_save_config_section_kv(const char *section, const char *key, const char *value)
+{
+	char tmp[256];
+	snprintf(tmp, sizeof(tmp), "%s.tmp", RA_CFG_PATH);
+
+	FILE *out = fopen(tmp, "w");
+	if (!out) { RA_LOG("ra_save_sec: cannot open %s for write", tmp); return 0; }
+
+	FILE *in = fopen(RA_CFG_PATH, "r");
+
+	int want_global    = (!section || !section[0]);
+	int in_target      = want_global;
+	int target_seen    = want_global;
+	int written        = 0;
+	int last_had_nl    = 1;
+	int pending_blanks = 0;   // gepufferte Leerzeilen am Sektionsende
+
+	if (in) {
+		char line[512];
+		while (fgets(line, sizeof(line), in)) {
+			char work[512];
+			snprintf(work, sizeof(work), "%s", line);
+			char *nl = strpbrk(work, "\r\n"); if (nl) *nl = '\0';
+			char *p = work; while (*p == ' ' || *p == '\t') p++;
+
+			if (p[0] == '[') {                       // Sektions-Kopfzeile
+				if (in_target && !written) {         // key vor die trailing-Blanks
+					if (!last_had_nl) fputc('\n', out);
+					fprintf(out, "%s=%s\n", key, value);
+					written = 1;
+				}
+				while (pending_blanks > 0) { fputc('\n', out); pending_blanks--; }
+
+				char sec[256]; sec[0] = 0;
+				char *rb = strchr(p, ']');
+				if (rb) { size_t l = rb - (p + 1); if (l < sizeof(sec)) { memcpy(sec, p + 1, l); sec[l] = 0; } }
+				in_target = (!want_global && !strcasecmp(sec, section));
+				if (in_target) target_seen = 1;
+
+				fputs(line, out);
+				size_t l = strlen(line); last_had_nl = (l && line[l - 1] == '\n');
+				continue;
+			}
+
+			if (in_target && !written && p[0] == '\0') { pending_blanks++; continue; }
+
+			if (in_target && !written) {
+				while (pending_blanks > 0) { fputc('\n', out); pending_blanks--; last_had_nl = 1; }
+				char *eq = strchr(p, '=');
+				if (p[0] != '#' && eq) {
+					char kbuf[256]; size_t klen = eq - p;
+					if (klen < sizeof(kbuf)) {
+						memcpy(kbuf, p, klen); kbuf[klen] = 0;
+						while (klen > 0 && (kbuf[klen-1] == ' ' || kbuf[klen-1] == '\t')) kbuf[--klen] = 0;
+						if (!strcasecmp(kbuf, key)) {
+							fprintf(out, "%s=%s\n", key, value);
+							written = 1; last_had_nl = 1;
+							continue;
+						}
+					}
+				}
+			}
+			fputs(line, out);
+			size_t l = strlen(line); last_had_nl = (l && line[l - 1] == '\n');
+		}
+		fclose(in);
+	}
+
+	if (!written) {
+		if (in_target) {
+			if (!last_had_nl) fputc('\n', out);
+			fprintf(out, "%s=%s\n", key, value);
+		} else if (!target_seen) {
+			if (!last_had_nl) fputc('\n', out);
+			fprintf(out, "\n[%s]\n%s=%s\n", section, key, value);
+		}
+	}
+	while (pending_blanks > 0) { fputc('\n', out); pending_blanks--; }
+
+	fflush(out);
+	fsync(fileno(out));
+	fclose(out);
+
+	if (rename(tmp, RA_CFG_PATH) != 0) { RA_LOG("ra_save_sec: rename failed"); remove(tmp); return 0; }
+	RA_LOG("ra_save_sec: [%s] %s=%s", section && section[0] ? section : "(global)", key, value);
+	return 1;
+}
+
+// Bequemer Wrapper: in die Sektion des laufenden Cores schreiben (sonst global).
+static int ra_save_popup_kv(const char *key, const char *value)
+{
+	char sec[256];
+	ra_current_popup_section(sec, sizeof(sec));
+	return ra_save_config_section_kv(sec[0] ? sec : NULL, key, value);
+}
+
+#define RA_H_OFFSET_MIN (-250)
+#define RA_H_OFFSET_MAX ( 250)
+#define RA_V_OFFSET_MIN (-40)
+#define RA_V_OFFSET_MAX ( 40)
+
+// ----------------------------------------------------------------------------
+//  popup_position: section-aware. Ersetzt die bisherige Version, die global
+//  via ra_save_config_kv() geschrieben hat.
+//  (Enum -> sofort schreiben, kein Debounce.)
+void achievements_set_popup_pos(int pos)
+{
+	g_popup_pos = pos;
+	ra_save_popup_kv("popup_position", ra_popup_pos_name(pos));
+}
+
+// ----------------------------------------------------------------------------
+//  Offsets: Live-Set (sofort sichtbar, weil InfoAligned() das g_* pro Draw
+//  liest) + entprelltes Persistieren. Write NICHT pro Tastendruck, sondern
+//  gebündelt beim Verlassen der Zeile/Seite über achievements_flush_popup_offsets().
+static int g_h_offset_dirty = 0;
+static int g_v_offset_dirty = 0;
+
+static int ra_clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+void achievements_set_popup_h_offset_live(int v)
+{
+	g_popup_h_offset = ra_clampi(v, RA_H_OFFSET_MIN, RA_H_OFFSET_MAX);
+	g_h_offset_dirty = 1;
+}
+void achievements_set_popup_v_offset_live(int v)
+{
+	g_popup_v_offset = ra_clampi(v, RA_V_OFFSET_MIN, RA_V_OFFSET_MAX);
+	g_v_offset_dirty = 1;
+}
+
+// Schreibt NUR die tatsächlich geänderten Offsets in die Core-Sektion und
+// löscht die Dirty-Flags. Idempotent -- mehrfach aufrufbar (No-op wenn clean).
+void achievements_flush_popup_offsets(void)
+{
+	char buf[16];
+	if (g_h_offset_dirty) {
+		snprintf(buf, sizeof(buf), "%d", g_popup_h_offset);
+		if (ra_save_popup_kv("popup_h_offset", buf)) g_h_offset_dirty = 0;
+	}
+	if (g_v_offset_dirty) {
+		snprintf(buf, sizeof(buf), "%d", g_popup_v_offset);
+		if (ra_save_popup_kv("popup_v_offset", buf)) g_v_offset_dirty = 0;
+	}
+}
+
+int achievements_get_popup_h_offset(void) { return g_popup_h_offset; }
+int achievements_get_popup_v_offset(void) { return g_popup_v_offset; }
+
 static int ra_load_credentials(void)
 {
 	g_ra_user[0] = '\0';
@@ -711,6 +990,8 @@ static int ra_load_credentials(void)
 	int legacy_leaderboards_defined = 0;
 	int show_leaderboards_updates_defined = 0;
 	int show_leaderboards_submission_defined = 0;
+	const char *core_name = user_io_get_core_name(1);
+	int section_active = 1; // global block (before any "[NAME]" header) always applies
 
 	FILE *f = fopen(RA_CFG_PATH, "r");
 	if (!f) {
@@ -729,8 +1010,23 @@ static int ra_load_credentials(void)
 		nl = strchr(line, '\r');
 		if (nl) *nl = '\0';
 
+		// Trim trailing spaces/tabs so "[SNES] " still matches as a section header
+		{
+			size_t len = strlen(line);
+			while (len > 0 && (line[len - 1] == ' ' || line[len - 1] == '\t')) line[--len] = '\0';
+		}
+
 		// Skip comments and empty lines
 		if (line[0] == '#' || line[0] == '\0') continue;
+
+		int section_match = ra_cfg_section_matches(line, core_name);
+		if (section_match >= 0) {
+			section_active = section_match;
+			RA_LOG("Config: section '%s' -> %s (core=%s)", line,
+				section_active ? "active" : "skipped", core_name ? core_name : "(null)");
+			continue;
+		}
+		if (!section_active) continue;
 
 		char *eq = strchr(line, '=');
 		if (!eq) continue;
@@ -798,6 +1094,10 @@ static int ra_load_credentials(void)
 			g_list_hotkey = atoi(val);
 		} else if (!strcasecmp(key, "popup_position")) {
 			g_popup_pos = ra_parse_popup_pos(val);
+		} else if (!strcasecmp(key, "popup_h_offset")) {
+			g_popup_h_offset = atoi(val);
+		} else if (!strcasecmp(key, "popup_v_offset")) {
+			g_popup_v_offset = atoi(val);
 		} else if (!strcasecmp(key, "smart_cleanup")) {
 			g_smart_cleanup = atoi(val);
 		} else if (!strcasecmp(key, "justifier_test")) {
@@ -835,6 +1135,74 @@ static int ra_load_credentials(void)
 		g_show_leaderboards_updates, g_show_leaderboards_submission, g_leaderboards_enabled,
                 g_hardcore, g_force_hardcore, g_stall_recovery, g_rtquery_enabled, g_recollect_interval, g_smart_cache, g_smart_cleanup, g_justifier_test, g_n64_snapshot, g_gba_reset_ram, g_multiline_desc, g_desc_ticker, g_list_hotkey, ra_popup_pos_name(g_popup_pos), g_ra_debug, g_async_log);
 	return 1;
+}
+
+// Re-reads only the three popup-placement settings (popup_position,
+// popup_h_offset, popup_v_offset) from retroachievements.cfg, using whichever
+// core is active right now for section matching. ra_load_credentials() only
+// runs once at achievements_init(), with whatever core happened to be active
+// at boot -- a core-scoped popup section would otherwise "stick" from that
+// first core and never re-evaluate for any core loaded afterward. Called from
+// achievements_load_game() instead, once per game/core load. No credentials,
+// no other config keys -- everything else is still owned by
+// ra_load_credentials(). The three globals are reset to their hardcoded
+// defaults before parsing (same defaults as the static initializers), so a
+// core switch can't inherit stale values left over from the previous core's
+// matched section when the new core has no section of its own.
+static void ra_load_popup_settings(void)
+{
+	g_popup_pos = INFO_ALIGN_LEFT;
+	g_popup_h_offset = 0;
+	g_popup_v_offset = 0;
+
+	FILE *f = fopen(RA_CFG_PATH, "r");
+	if (!f) return;
+
+	char section[256];
+	ra_current_popup_section(section, sizeof(section));
+	int section_active = 1; // global block (before any "[NAME]" header) always applies
+
+	char line[512];
+	while (fgets(line, sizeof(line), f)) {
+		char *nl = strchr(line, '\n');
+		if (nl) *nl = '\0';
+		nl = strchr(line, '\r');
+		if (nl) *nl = '\0';
+
+		{
+			size_t len = strlen(line);
+			while (len > 0 && (line[len - 1] == ' ' || line[len - 1] == '\t')) line[--len] = '\0';
+		}
+
+		if (line[0] == '#' || line[0] == '\0') continue;
+
+		int section_match = ra_cfg_section_matches(line, section);
+		if (section_match >= 0) {
+			section_active = section_match;
+			continue;
+		}
+		if (!section_active) continue;
+
+		char *eq = strchr(line, '=');
+		if (!eq) continue;
+
+		*eq = '\0';
+		const char *key = line;
+		const char *val = eq + 1;
+		while (*val == ' ' || *val == '\t') val++;
+
+		if (!strcasecmp(key, "popup_position")) {
+			g_popup_pos = ra_parse_popup_pos(val);
+		} else if (!strcasecmp(key, "popup_h_offset")) {
+			g_popup_h_offset = atoi(val);
+		} else if (!strcasecmp(key, "popup_v_offset")) {
+			g_popup_v_offset = atoi(val);
+		}
+	}
+	fclose(f);
+
+	RA_LOG("Popup settings for core '%s': popup_position=%s popup_h_offset=%d popup_v_offset=%d",
+		section[0] ? section : "(null)", ra_popup_pos_name(g_popup_pos), g_popup_h_offset, g_popup_v_offset);
 }
 
 
@@ -1045,6 +1413,17 @@ static void ra_server_call(const rc_api_request_t *request,
 		http_done, bridge);
 }
 
+// Split text at last space before max_width. Falls back to hard cut if no
+// space found. Returns number of characters for the first line.
+static int word_wrap_split(const char *text, int max_width)
+{
+	int len = (int)strlen(text);
+	if (len <= max_width) return len;
+	int split = max_width;
+	while (split > 0 && text[split] != ' ') split--;
+	return (split == 0) ? max_width : split;
+}
+
 static void ra_event_handler(const rc_client_event_t *event, rc_client_t *client)
 {
 	(void)client;
@@ -1061,26 +1440,112 @@ static void ra_event_handler(const rc_client_event_t *event, rc_client_t *client
 					gba_dump_trigger(event->achievement->id);
 					seladdr_trigdump_report(event->achievement->id,
 						event->achievement->title);
-				char title_buf[96];
-				ra_format_text(event->achievement->title, title_buf, sizeof(title_buf), 28, 28, 2);
-				// In multiline mode, prefix desc with "\-> " so it reads as a
-				// sub-line of the title. The prefix is added BEFORE wrapping so
-				// its 4 chars count toward the first line's width (adding it
-				// after wrapping pushed the first line past the OSD width).
-				char desc_display[200];
-				if (g_multiline_desc) {
-					char desc_prefixed[224];
-					snprintf(desc_prefixed, sizeof(desc_prefixed), "\\-> %s",
-						event->achievement->description);
-					ra_format_text(desc_prefixed, desc_display, sizeof(desc_display), 28, 28, 3);
-				} else {
-					ra_format_text(event->achievement->description, desc_display, sizeof(desc_display), 28, 28, 3);
+				// OSD Info-Popup: INFO_MAXW=32, minus 2 Rahmen-Spalten = 30 Zeichen
+				const int LINE_W = 30;
+
+				// Punkte-Suffix [+X] ans Ende der letzten Zeile
+				char pts_suffix[16] = {};
+				snprintf(pts_suffix, sizeof(pts_suffix), "[+%u]", event->achievement->points);
+				int pts_len = (int)strlen(pts_suffix);
+
+				// Dynamische Popup-Dauer basierend auf Punktewert
+				int duration_ms;
+				if      (event->achievement->points <  10) duration_ms = 5000;
+				else if (event->achievement->points <  25) duration_ms = 6000;
+				else if (event->achievement->points <  50) duration_ms = 7000;
+				else                                       duration_ms = 8000;
+
+				// Titel: Word-Wrap auf bis zu zwei Zeilen
+				char title_a[32] = {};
+				char title_b[32] = {};
+				{
+					const char *t = event->achievement->title;
+					size_t tlen = strlen(t);
+					if (tlen <= (size_t)LINE_W) {
+						memcpy(title_a, t, tlen);
+					} else {
+						int split = word_wrap_split(t, LINE_W);
+						memcpy(title_a, t, split);
+						const char *rest = t + split;
+						while (*rest == ' ') rest++;
+						size_t rlen = strlen(rest);
+						if (rlen <= (size_t)LINE_W) {
+							memcpy(title_b, rest, rlen);
+						} else {
+							memcpy(title_b, rest, LINE_W - 3);
+							strcat(title_b, "...");
+						}
+					}
 				}
+
+				// Beschreibung: Word-Wrap über verfügbare Zeilen
+				int desc_lines_available = title_b[0] ? 2 : 3;
+				char desc_seg[3][64] = {};
+				int desc_seg_count = 0;
+				{
+					const char *pos = event->achievement->description;
+					for (int i = 0; i < desc_lines_available; i++) {
+						if (!pos || !*pos) break;
+						int remaining_len = (int)strlen(pos);
+						bool is_last_possible_line = (i == desc_lines_available - 1);
+						bool fits_without_wrap = (remaining_len <= LINE_W);
+						bool reserve_points = fits_without_wrap || is_last_possible_line;
+						int avail = reserve_points ? (LINE_W - pts_len) : LINE_W;
+						if (avail < 5) avail = 5;
+						if (remaining_len <= avail) {
+							memcpy(desc_seg[i], pos, remaining_len);
+							desc_seg[i][remaining_len] = '\0';
+							desc_seg_count = i + 1;
+							pos = NULL;
+						} else {
+							int split = word_wrap_split(pos, avail);
+							memcpy(desc_seg[i], pos, split);
+							desc_seg[i][split] = '\0';
+							desc_seg_count = i + 1;
+							pos += split;
+							while (*pos == ' ') pos++;
+							if (is_last_possible_line && pos && *pos) {
+								int cur_len = (int)strlen(desc_seg[i]);
+								int max_with_ellipsis = avail - 3;
+								if (max_with_ellipsis < 1) max_with_ellipsis = 1;
+								if (cur_len > max_with_ellipsis) desc_seg[i][max_with_ellipsis] = '\0';
+								strcat(desc_seg[i], "...");
+								pos = NULL;
+							}
+						}
+					}
+				}
+
+				// Punkte-Suffix ans Ende der letzten Beschreibungszeile
+				if (desc_seg_count > 0) {
+					strncat(desc_seg[desc_seg_count - 1], pts_suffix,
+						sizeof(desc_seg[0]) - strlen(desc_seg[desc_seg_count - 1]) - 1);
+				}
+
+				// Popup zusammenbauen (max. 4 Zeilen)
 				char buf[NOTIF_TEXT_MAX];
-				snprintf(buf, sizeof(buf),
-					">> ACHIEVEMENT <<\n\n%s\n%s",
-					title_buf, desc_display);
-								ra_notify_urgent(buf, 4000, 1);
+				if (title_b[0]) {
+					if (desc_seg_count >= 2)
+						snprintf(buf, sizeof(buf), "%s\n%s\n%s\n%s",
+							title_a, title_b, desc_seg[0], desc_seg[1]);
+					else if (desc_seg_count == 1)
+						snprintf(buf, sizeof(buf), "%s\n%s\n%s",
+							title_a, title_b, desc_seg[0]);
+					else
+						snprintf(buf, sizeof(buf), "%s\n%s", title_a, title_b);
+				} else {
+					if (desc_seg_count >= 3)
+						snprintf(buf, sizeof(buf), "%s\n%s\n%s\n%s",
+							title_a, desc_seg[0], desc_seg[1], desc_seg[2]);
+					else if (desc_seg_count == 2)
+						snprintf(buf, sizeof(buf), "%s\n%s\n%s",
+							title_a, desc_seg[0], desc_seg[1]);
+					else if (desc_seg_count == 1)
+						snprintf(buf, sizeof(buf), "%s\n%s", title_a, desc_seg[0]);
+					else
+						snprintf(buf, sizeof(buf), "%s", title_a);
+				}
+				ra_notify_urgent(buf, duration_ms, 1);
 			}
 		}
 		break;
@@ -1091,11 +1556,48 @@ static void ra_event_handler(const rc_client_event_t *event, rc_client_t *client
 				event->achievement->id, event->achievement->title);
 			if (g_show_challenge_show_popup &&
 			    !ra_challenge_popup_suppressed(event->achievement->id)) {
-				char title_buf[96];
-				ra_format_text(event->achievement->title, title_buf, sizeof(title_buf), 28, 28, 2);
+				const int LINE_W  = 30;
+				const int L1_W    = LINE_W - 4; // "[A] " = 4 Zeichen
+				const char *progress  = event->achievement->measured_progress;
+				bool has_progress     = progress && progress[0];
+				int max_desc_lines    = has_progress ? 3 : 4;
+				char lines[4][32] = {};
+				int  line_count   = 0;
+				const char *pos   = event->achievement->description;
+				for (int i = 0; i < max_desc_lines && pos && *pos; i++) {
+					int avail = (i == 0) ? L1_W : LINE_W;
+					int rem   = (int)strlen(pos);
+					bool last = (i == max_desc_lines - 1);
+					if (rem <= avail) {
+						memcpy(lines[i], pos, rem);
+						line_count = i + 1; pos = NULL;
+					} else {
+						int split = word_wrap_split(pos, avail);
+						memcpy(lines[i], pos, split);
+						lines[i][split] = '\0'; line_count = i + 1;
+						pos += split; while (*pos == ' ') pos++;
+						if (last && pos && *pos) {
+							int cur = (int)strlen(lines[i]);
+							int mt = avail - 3; if (mt < 1) mt = 1;
+							if (cur > mt) lines[i][mt] = '\0';
+							strcat(lines[i], "..."); pos = NULL;
+						}
+					}
+				}
 				char buf[NOTIF_TEXT_MAX];
-				snprintf(buf, sizeof(buf), "CHALLENGE ACTIVE\n\n%s", title_buf);
-				ra_notify(buf, 3000);
+				char l1[36] = {};
+				snprintf(l1, sizeof(l1), "[A] %s", lines[0]);
+				switch (line_count) {
+					case 1:  snprintf(buf, sizeof(buf), "%s", l1); break;
+					case 2:  snprintf(buf, sizeof(buf), "%s\n%s", l1, lines[1]); break;
+					case 3:  snprintf(buf, sizeof(buf), "%s\n%s\n%s", l1, lines[1], lines[2]); break;
+					default: snprintf(buf, sizeof(buf), "%s\n%s\n%s\n%s", l1, lines[1], lines[2], lines[3]); break;
+				}
+				if (has_progress) {
+					int cur = (int)strlen(buf);
+					snprintf(buf + cur, sizeof(buf) - cur, "\n%s", progress);
+				}
+				ra_notify_urgent(buf, 6000);
 			}
 		}
 		break;
@@ -1105,11 +1607,52 @@ static void ra_event_handler(const rc_client_event_t *event, rc_client_t *client
 			RA_LOG("CHALLENGE HIDE: [%u] %s",
 				event->achievement->id, event->achievement->title);
 			if (g_show_challenge_hide_popup) {
-				char title_buf[96];
-				ra_format_text(event->achievement->title, title_buf, sizeof(title_buf), 28, 28, 2);
+				// [P] weglassen — Achievement-Popup übernimmt das bereits.
+				// Nur [F] anzeigen wenn Challenge fehlgeschlagen.
+				if (event->achievement->state == RC_CLIENT_ACHIEVEMENT_STATE_UNLOCKED)
+					break;
+				const int LINE_W  = 30;
+				const int L1_W    = LINE_W - 4; // "[F] " = 4 Zeichen
+				const char *progress  = event->achievement->measured_progress;
+				bool has_progress     = progress && progress[0];
+				int max_desc_lines    = has_progress ? 3 : 4;
+				char lines[4][32] = {};
+				int  line_count   = 0;
+				const char *pos   = event->achievement->description;
+				for (int i = 0; i < max_desc_lines && pos && *pos; i++) {
+					int avail = (i == 0) ? L1_W : LINE_W;
+					int rem   = (int)strlen(pos);
+					bool last = (i == max_desc_lines - 1);
+					if (rem <= avail) {
+						memcpy(lines[i], pos, rem);
+						line_count = i + 1; pos = NULL;
+					} else {
+						int split = word_wrap_split(pos, avail);
+						memcpy(lines[i], pos, split);
+						lines[i][split] = '\0'; line_count = i + 1;
+						pos += split; while (*pos == ' ') pos++;
+						if (last && pos && *pos) {
+							int cur = (int)strlen(lines[i]);
+							int mt = avail - 3; if (mt < 1) mt = 1;
+							if (cur > mt) lines[i][mt] = '\0';
+							strcat(lines[i], "..."); pos = NULL;
+						}
+					}
+				}
 				char buf[NOTIF_TEXT_MAX];
-				snprintf(buf, sizeof(buf), "CHALLENGE MISSED\n\n%s", title_buf);
-				ra_notify(buf, 3000);
+				char l1[36] = {};
+				snprintf(l1, sizeof(l1), "[F] %s", lines[0]);
+				switch (line_count) {
+					case 1:  snprintf(buf, sizeof(buf), "%s", l1); break;
+					case 2:  snprintf(buf, sizeof(buf), "%s\n%s", l1, lines[1]); break;
+					case 3:  snprintf(buf, sizeof(buf), "%s\n%s\n%s", l1, lines[1], lines[2]); break;
+					default: snprintf(buf, sizeof(buf), "%s\n%s\n%s\n%s", l1, lines[1], lines[2], lines[3]); break;
+				}
+				if (has_progress) {
+					int cur = (int)strlen(buf);
+					snprintf(buf + cur, sizeof(buf) - cur, "\n%s", progress);
+				}
+				ra_notify_urgent(buf, 6000);
 			}
 		}
 		break;
@@ -1131,10 +1674,35 @@ static void ra_event_handler(const rc_client_event_t *event, rc_client_t *client
 			    !ra_progress_popup_suppressed(event->achievement->id, event->achievement->measured_progress)) {
 				char buf[NOTIF_TEXT_MAX];
 				if (g_show_progress_name) {
-					char title_buf[96];
-					ra_format_text(event->achievement->title, title_buf, sizeof(title_buf), 28, 28, 2);
-					snprintf(buf, sizeof(buf), "%s\nProgress: %s",
-						title_buf, event->achievement->measured_progress);
+					const int LINE_W = 30;
+					char title_a[32] = {};
+					char title_b[32] = {};
+					{
+						const char *t = event->achievement->title;
+						size_t tlen = strlen(t);
+						if (tlen <= (size_t)LINE_W) {
+							memcpy(title_a, t, tlen);
+						} else {
+							int split = word_wrap_split(t, LINE_W);
+							memcpy(title_a, t, split);
+							const char *rest = t + split;
+							while (*rest == ' ') rest++;
+							size_t rlen = strlen(rest);
+							if (rlen <= (size_t)LINE_W) {
+								memcpy(title_b, rest, rlen);
+							} else {
+								memcpy(title_b, rest, LINE_W - 3);
+								strcat(title_b, "...");
+							}
+						}
+					}
+					if (title_b[0]) {
+						snprintf(buf, sizeof(buf), "%s\n%s\nProgress: %s",
+							title_a, title_b, event->achievement->measured_progress);
+					} else {
+						snprintf(buf, sizeof(buf), "%s\nProgress: %s",
+							title_a, event->achievement->measured_progress);
+					}
 				} else {
 					snprintf(buf, sizeof(buf), "Progress: %s",
 						event->achievement->measured_progress);
@@ -1262,8 +1830,7 @@ static void ra_event_handler(const rc_client_event_t *event, rc_client_t *client
 
         case RC_CLIENT_EVENT_GAME_COMPLETED:
 		RA_LOG("*** GAME COMPLETED! ***");
-		ra_notify_urgent("** GAME COMPLETED! **\n\nCongratulations!", 5000);
-		ra_play_achievement_sound();
+		ra_notify_urgent("** GAME COMPLETED! **\n\nCongratulations!", 5000, 1);
 		break;
 
 	case RC_CLIENT_EVENT_RESET:
@@ -1695,6 +2262,12 @@ static void ra_update_user_agent(void)
 void achievements_load_game(const char *rom_path, uint32_t crc32)
 {
         if (!g_active_handler) return;
+
+        // Popup placement is core-scoped (retroachievements.cfg: [SNES]/[N64]/...
+        // sections) but ra_load_credentials() only ran once at boot against
+        // whatever core was active then. Re-evaluate here, every load, against
+        // the core that's actually active now.
+        ra_load_popup_settings();
 
         // Virtual Boy: the OSD offers auxiliary loads without the config-store
         // flag (VBT brightness tables, TAS movies) that also land here. Only a
@@ -2350,13 +2923,13 @@ int achievements_justifier_test(void)
 void achievements_info(void)
 {
 	if (!ra_core_supported()) {
-                InfoAligned("RetroAchievements\n\nCore not supported", 2000, g_popup_pos, 1);
+                InfoAligned("RetroAchievements\n\nCore not supported", 2000, g_popup_pos, 1, g_popup_h_offset, g_popup_v_offset);
                 return;
         }
 
 #ifdef HAS_RCHEEVOS
         if (!ra_has_internet_connectivity()) {
-                InfoAligned("RetroAchievements\n\nSem internet\nConecte a rede para o RA funcionar", 2500, g_popup_pos, 1);
+                InfoAligned("RetroAchievements\n\nSem internet\nConecte a rede para o RA funcionar", 2500, g_popup_pos, 1, g_popup_h_offset, g_popup_v_offset);
                 return;
         }
 #endif
@@ -2427,7 +3000,7 @@ void achievements_info(void)
 
 	#undef NOTIF_APPEND
 
-	InfoAligned(buf, 4000, g_popup_pos, 1);
+	InfoAligned(buf, 4000, g_popup_pos, 1, g_popup_h_offset, g_popup_v_offset);
 }
 
 // ---------------------------------------------------------------------------
