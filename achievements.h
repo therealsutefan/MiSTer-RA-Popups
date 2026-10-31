@@ -132,6 +132,17 @@ void achievements_flush_popup_offsets(void);
 int achievements_get_popup_h_offset(void);
 int achievements_get_popup_v_offset(void);
 
+// Achievement sound (retroachievements.cfg: sound_file; global setting).
+// Files are .wav in /media/fat/achievement_sounds/, listed alphabetically.
+int achievements_sound_scan(void); // re-reads the folder, returns the file count (max 64)
+int achievements_sound_count(void);
+const char *achievements_sound_name(int i);
+const char *achievements_get_sound(void); // "" = default, "off" = no sound, else filename
+void achievements_set_sound(const char *name); // set + save
+void achievements_set_sound_live(const char *name); // set only (no write per keypress) ...
+void achievements_flush_sound(void); // ... + debounced flush
+void achievements_preview_sound(void); // plays the selected sound once
+
 // Returns the total count in the currently open list (0 if not open).
 int achievements_list_count(void);
 

@@ -9,6 +9,7 @@
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <pthread.h>
 #include <signal.h>
 #include <execinfo.h>
@@ -358,6 +359,8 @@ void ra_frame_processed(uint32_t frame)
 // Config file path
 #define RA_CFG_PATH  "/media/fat/retroachievements.cfg"
 #define RA_SFX_PATH  "/media/fat/achievement.wav"
+#define RA_SOUND_DIR "/media/fat/achievement_sounds"
+#define RA_SOUND_MAX 64
 
 // Popup display settings (from retroachievements.cfg)
 static int g_show_challenge_show_popup = 1; // 1 = show popup on challenge SHOW event
@@ -385,6 +388,7 @@ static int g_popup_pos                 = INFO_ALIGN_LEFT; // popup corner: left 
 static int g_psx_blanking_sync         = 1;  // 1 = PSX core dispatches RA DDR3 traffic only during blanking (retroachievements.cfg: psx_blanking_sync)
 static int g_popup_h_offset            = 0; // extra inward step-offset for left/right popup placement (retroachievements.cfg: popup_h_offset)
 static int g_popup_v_offset            = 0; // vertical popup offset, additive to the default row (retroachievements.cfg: popup_v_offset)
+static char g_sound_file[256]          = ""; // achievement sound: "" = default, "off" = none, else filename in RA_SOUND_DIR (retroachievements.cfg: sound_file)
 
 // Debug watch list (retroachievements.cfg: watch=19807d,19795a — RA addresses
 // in hex). Handlers log every value change of these addresses per frame.
@@ -456,43 +460,172 @@ static int ra_progress_popup_suppressed(uint32_t id, const char *progress)
 
 // ---------------------------------------------------------------------------
 // Achievement Sound
+//
+// retroachievements.cfg: sound_file (global, filename only, no per-core
+// sections). "off" = no sound; a name = RA_SOUND_DIR/<name> if readable;
+// empty, missing, invalid or unreadable = RA_SFX_PATH, the default. The
+// RA Settings menu lists the .wav files in RA_SOUND_DIR.
 // ---------------------------------------------------------------------------
+
+static int  g_sound_dirty = 0;
+static char g_sound_names[RA_SOUND_MAX][256];
+static int  g_sound_count = 0;
+
+static void ra_set_sound_file(const char *name)
+{
+	snprintf(g_sound_file, sizeof(g_sound_file), "%s", strcasecmp(name, "off") ? name : "off");
+}
+
+// Names with a path component are rejected, so the file always stays in RA_SOUND_DIR.
+static int ra_sound_name_valid(const char *name)
+{
+	return name[0] && !strchr(name, '/') && !strstr(name, "..");
+}
+
+static void ra_sound_resolve(const char *name, char *path, size_t size)
+{
+	if (ra_sound_name_valid(name)) {
+		snprintf(path, size, "%s/%s", RA_SOUND_DIR, name);
+		if (access(path, R_OK) == 0) return;
+	}
+	snprintf(path, size, "%s", RA_SFX_PATH);
+}
+
+// A heap copy of the setting: the menu can change g_sound_file while the thread runs.
+struct ra_sound_req {
+	int  preview;
+	char name[sizeof(g_sound_file)];
+};
+
+// The running preview's aplay. A new preview kills and reaps it from another
+// thread, so a preview pid is only signalled or waited on under g_preview_lock:
+// once reaped, the pid may belong to an unrelated process.
+static pthread_mutex_t g_preview_lock = PTHREAD_MUTEX_INITIALIZER;
+static pid_t g_preview_pid = 0;
+
+// Call with g_preview_lock held.
+static void ra_preview_stop(void)
+{
+	if (g_preview_pid <= 0) return;
+	kill(g_preview_pid, SIGKILL);
+	waitpid(g_preview_pid, NULL, 0);
+	g_preview_pid = 0;
+}
+
+// Returns 1 once aplay is gone, whether it exited or a newer preview reaped it.
+static int ra_sound_finished(pid_t pid, int preview)
+{
+	if (!preview) return waitpid(pid, NULL, WNOHANG) == pid;
+
+	pthread_mutex_lock(&g_preview_lock);
+	int done = (g_preview_pid != pid);
+	if (!done && waitpid(pid, NULL, WNOHANG) == pid) {
+		g_preview_pid = 0;
+		done = 1;
+	}
+	pthread_mutex_unlock(&g_preview_lock);
+	return done;
+}
 
 static void *ra_play_thread(void *arg)
 {
-	(void)arg;
+	ra_sound_req *req = (ra_sound_req *)arg;
+	int preview = req->preview;
+	char path[300];
+	ra_sound_resolve(req->name, path, sizeof(path));
+	free(req);
+
 	// Only play if the file exists — silent no-op otherwise
-	if (access(RA_SFX_PATH, R_OK) != 0) return NULL;
+	if (access(path, R_OK) != 0) return NULL;
 
 	// fork/exec instead of system(): on cores built with MISTER_DISABLE_ALSA
 	// (e.g. N64, PSX) the FPGA never drains the ALSA ring buffer, so aplay
 	// blocks forever and every unlock would leak a process + thread. Kill it
 	// after a timeout instead.
+	if (preview) {
+		pthread_mutex_lock(&g_preview_lock);
+		ra_preview_stop();
+	}
 	pid_t pid = fork();
 	if (pid == 0) {
 		int fd = open("/dev/null", O_RDWR);
 		if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); if (fd > 2) close(fd); }
-		execlp("aplay", "aplay", "-q", RA_SFX_PATH, (char *)NULL);
+		execlp("aplay", "aplay", "-q", path, (char *)NULL);
 		_exit(127);
+	}
+	if (preview) {
+		if (pid > 0) g_preview_pid = pid;
+		pthread_mutex_unlock(&g_preview_lock);
 	}
 	if (pid < 0) return NULL;
 
 	// The jingle lasts ~1s; allow 5s before declaring aplay stuck.
 	for (int i = 0; i < 50; i++) {
-		if (waitpid(pid, NULL, WNOHANG) == pid) return NULL;
+		if (ra_sound_finished(pid, preview)) return NULL;
 		usleep(100000);
+	}
+	if (preview) {
+		pthread_mutex_lock(&g_preview_lock);
+		if (g_preview_pid == pid) ra_preview_stop();
+		pthread_mutex_unlock(&g_preview_lock);
+		return NULL;
 	}
 	kill(pid, SIGKILL);
 	waitpid(pid, NULL, 0);
 	return NULL;
 }
 
-static void ra_play_achievement_sound(void)
+static void ra_play_sound(int preview)
 {
+	if (!strcmp(g_sound_file, "off")) return;
+
+	ra_sound_req *req = (ra_sound_req *)malloc(sizeof(ra_sound_req));
+	if (!req) return;
+	req->preview = preview;
+	snprintf(req->name, sizeof(req->name), "%s", g_sound_file);
+
 	pthread_t th;
-	if (pthread_create(&th, NULL, ra_play_thread, NULL) == 0)
+	if (pthread_create(&th, NULL, ra_play_thread, req) == 0)
 		pthread_detach(th);
+	else
+		free(req);
 }
+
+static void ra_play_achievement_sound(void) { ra_play_sound(0); }
+void achievements_preview_sound(void) { ra_play_sound(1); }
+
+static int ra_sound_filter(const struct dirent *de)
+{
+	size_t len = strlen(de->d_name);
+	if (de->d_type == DT_DIR || de->d_name[0] == '.' || len < 4) return 0;
+	return !strcasecmp(de->d_name + len - 4, ".wav") && ra_sound_name_valid(de->d_name);
+}
+
+static int ra_sound_name_cmp(const struct dirent **a, const struct dirent **b)
+{
+	return strcasecmp((*a)->d_name, (*b)->d_name);
+}
+
+// Keeps the first RA_SOUND_MAX names in sorted order. A missing directory is an empty list.
+int achievements_sound_scan(void)
+{
+	struct dirent **list;
+	int n = scandir(RA_SOUND_DIR, &list, ra_sound_filter, ra_sound_name_cmp);
+
+	g_sound_count = 0;
+	if (n < 0) return 0;
+
+	for (int i = 0; i < n; i++) {
+		if (i < RA_SOUND_MAX) snprintf(g_sound_names[g_sound_count++], sizeof(g_sound_names[0]), "%s", list[i]->d_name);
+		free(list[i]);
+	}
+	free(list);
+	return g_sound_count;
+}
+
+int achievements_sound_count(void) { return g_sound_count; }
+const char *achievements_sound_name(int i) { return (i >= 0 && i < g_sound_count) ? g_sound_names[i] : ""; }
+const char *achievements_get_sound(void) { return g_sound_file; }
 
 // ---------------------------------------------------------------------------
 // OSD Notification — two-tier system
@@ -1005,6 +1138,26 @@ void achievements_flush_popup_offsets(void)
 int achievements_get_popup_h_offset(void) { return g_popup_h_offset; }
 int achievements_get_popup_v_offset(void) { return g_popup_v_offset; }
 
+// sound_file: Live-Set + Flush beim Verlassen der Seite, wie die Offsets.
+// Immer in den globalen Block schreiben: ra_save_config_kv() hängt einen neuen
+// key ans Dateiende, also in die letzte [Core]-Sektion, die beim Boot nicht gilt.
+void achievements_set_sound_live(const char *name)
+{
+	ra_set_sound_file(name);
+	g_sound_dirty = 1;
+}
+
+void achievements_flush_sound(void)
+{
+	if (g_sound_dirty && ra_save_config_section_kv(NULL, "sound_file", g_sound_file)) g_sound_dirty = 0;
+}
+
+void achievements_set_sound(const char *name)
+{
+	achievements_set_sound_live(name);
+	achievements_flush_sound();
+}
+
 static int ra_load_credentials(void)
 {
 	g_ra_user[0] = '\0';
@@ -1122,6 +1275,8 @@ static int ra_load_credentials(void)
 			g_popup_h_offset = atoi(val);
 		} else if (!strcasecmp(key, "popup_v_offset")) {
 			g_popup_v_offset = atoi(val);
+		} else if (!strcasecmp(key, "sound_file")) {
+			ra_set_sound_file(val);
 		} else if (!strcasecmp(key, "smart_cleanup")) {
 			g_smart_cleanup = atoi(val);
 		} else if (!strcasecmp(key, "justifier_test")) {
