@@ -372,6 +372,10 @@ All options live in `/media/fat/retroachievements.cfg`:
 | `watch` | - | Debug: comma-separated RA addresses to log on change |
 | `debug` | 0 | Verbose RA logging |
 
+### RA Settings
+
+Settings changed while a core is running are saved to that core's section if it already has one, otherwise globally. To make a core follow the global value again, delete its line from that core's section in `retroachievements.cfg`.
+
 ### Achievement Sound
 
 `/media/fat/achievement.wav` stays the default unlock sound. To choose another one, copy files to `/media/fat/achievement_sounds/` and select them under **Sound** in RA Settings; left/right cycles Default, the files and Off, with a preview on each change. New files show up the next time you open RA Settings.

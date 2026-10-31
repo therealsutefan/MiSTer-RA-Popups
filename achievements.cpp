@@ -932,64 +932,7 @@ static int ra_cfg_section_matches(const char *line, const char *core_name)
 	return (core_name && core_name[0] && !strcasecmp(name, core_name)) ? 1 : 0;
 }
 
-// Schreibt GENAU einen key=value in die cfg zurück.
-//  - vorhandene Zeile (key case-insensitive) wird ersetzt
-//  - Kommentare (#...) und alle übrigen Zeilen bleiben 1:1 erhalten
-//  - fehlender key wird angehängt
-//  - atomar: .tmp schreiben, fsync, rename() über das Original
-static int ra_save_config_kv(const char *key, const char *value)
-{
-	char tmp[256];
-	snprintf(tmp, sizeof(tmp), "%s.tmp", RA_CFG_PATH);
-
-	FILE *out = fopen(tmp, "w");
-	if (!out) { RA_LOG("ra_save: cannot open %s for write", tmp); return 0; }
-
-	FILE *in = fopen(RA_CFG_PATH, "r");   // darf fehlen -> nur Append
-	int replaced    = 0;
-	int last_had_nl = 1;
-
-	if (in) {
-		char line[512];
-		while (fgets(line, sizeof(line), in)) {
-			char work[512];
-			snprintf(work, sizeof(work), "%s", line);
-			char *nl = strpbrk(work, "\r\n"); if (nl) *nl = '\0';
-
-			char *p = work; while (*p == ' ' || *p == '\t') p++;
-			char *eq = strchr(p, '=');
-			if (p[0] != '#' && p[0] != '\0' && eq) {
-				*eq = '\0';
-				if (!strcasecmp(p, key)) {
-					fprintf(out, "%s=%s\n", key, value);
-					replaced = 1; last_had_nl = 1;
-					continue;
-				}
-			}
-			fputs(line, out);
-			size_t len = strlen(line);
-			last_had_nl = (len && line[len - 1] == '\n');
-		}
-		fclose(in);
-	}
-
-	if (!replaced) {
-		if (!last_had_nl) fputc('\n', out);
-		fprintf(out, "%s=%s\n", key, value);
-	}
-
-	fflush(out);
-	fsync(fileno(out));
-	fclose(out);
-
-	if (rename(tmp, RA_CFG_PATH) != 0) {
-		RA_LOG("ra_save: rename %s -> %s failed", tmp, RA_CFG_PATH);
-		remove(tmp);
-		return 0;
-	}
-	RA_LOG("ra_save: %s=%s", key, value);
-	return 1;
-}
+static int ra_save_config_kv(const char *key, const char *value);
 
 // --- Bool-Toggles: g_* direkt setzen + persistieren --------------------------
 void achievements_set_challenge_show(int on) { g_show_challenge_show_popup = !!on; ra_save_config_kv("show_challenge_show_popup", on ? "1" : "0"); }
@@ -1086,7 +1029,7 @@ static int ra_save_config_section_kv(const char *section, const char *key, const
 
 			if (in_target && !written && p[0] == '\0') { pending_blanks++; continue; }
 
-			if (in_target && !written) {
+			if (in_target) {                         // auch Duplikate im Block ersetzen
 				while (pending_blanks > 0) { fputc('\n', out); pending_blanks--; last_had_nl = 1; }
 				char *eq = strchr(p, '=');
 				if (p[0] != '#' && eq) {
@@ -1134,6 +1077,45 @@ static int ra_save_popup_kv(const char *key, const char *value)
 	char sec[256];
 	ra_current_popup_section(sec, sizeof(sec));
 	return ra_save_config_section_kv(sec[0] ? sec : NULL, key, value);
+}
+
+// 1 = key steht in [section] (Header-Erkennung wie beim Laden).
+static int ra_cfg_section_has_key(const char *section, const char *key)
+{
+	FILE *f = fopen(RA_CFG_PATH, "r");
+	if (!f) return 0;
+
+	int in_section = 0;
+	int found      = 0;
+	char line[512];
+	while (!found && fgets(line, sizeof(line), f)) {
+		char *nl = strpbrk(line, "\r\n"); if (nl) *nl = '\0';
+		char *p = line; while (*p == ' ' || *p == '\t') p++;
+		size_t len = strlen(p);
+		while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t')) p[--len] = '\0';
+
+		int section_match = ra_cfg_section_matches(p, section);
+		if (section_match >= 0) { in_section = section_match; continue; }
+		if (!in_section || p[0] == '#') continue;
+
+		char *eq = strchr(p, '=');
+		if (!eq) continue;
+		while (eq > p && (eq[-1] == ' ' || eq[-1] == '\t')) eq--;
+		*eq = '\0';
+		found = !strcasecmp(p, key);
+	}
+	fclose(f);
+	return found;
+}
+
+// Ziel für im Menü geänderte Keys: steht der key in der Sektion des aktiven
+// Cores, gilt dort diese Zeile und wird dort aktualisiert, sonst der globale
+// Block (vor der ersten [..]-Zeile). Neue Sektions-Einträge entstehen hier nie.
+static int ra_save_config_kv(const char *key, const char *value)
+{
+	char sec[256];
+	ra_current_popup_section(sec, sizeof(sec));
+	return ra_save_config_section_kv((sec[0] && ra_cfg_section_has_key(sec, key)) ? sec : NULL, key, value);
 }
 
 #define RA_H_OFFSET_MIN (-250)
@@ -1190,8 +1172,6 @@ int achievements_get_popup_h_offset(void) { return g_popup_h_offset; }
 int achievements_get_popup_v_offset(void) { return g_popup_v_offset; }
 
 // sound_file: Live-Set + Flush beim Verlassen der Seite, wie die Offsets.
-// Immer in den globalen Block schreiben: ra_save_config_kv() hängt einen neuen
-// key ans Dateiende, also in die letzte [Core]-Sektion, die beim Boot nicht gilt.
 void achievements_set_sound_live(const char *name)
 {
 	ra_set_sound_file(name);
@@ -1200,7 +1180,7 @@ void achievements_set_sound_live(const char *name)
 
 void achievements_flush_sound(void)
 {
-	if (g_sound_dirty && ra_save_config_section_kv(NULL, "sound_file", g_sound_file)) g_sound_dirty = 0;
+	if (g_sound_dirty && ra_save_config_kv("sound_file", g_sound_file)) g_sound_dirty = 0;
 }
 
 void achievements_set_sound(const char *name)
@@ -1384,12 +1364,12 @@ static int ra_load_credentials(void)
 
 // Re-reads only the three popup-placement settings (popup_position,
 // popup_h_offset, popup_v_offset) from retroachievements.cfg, using whichever
-// core is active right now for section matching. ra_load_credentials() only
-// runs once at achievements_init(), with whatever core happened to be active
-// at boot -- a core-scoped popup section would otherwise "stick" from that
-// first core and never re-evaluate for any core loaded afterward. Called from
-// achievements_load_game() instead, once per game/core load. No credentials,
-// no other config keys -- everything else is still owned by
+// core is active right now for section matching. ra_load_credentials() runs
+// once per process start in achievements_init(); a core load re-execs MiSTer
+// (fpga_load_rbf -> app_restart), so that pass already sees the new core.
+// This one runs from achievements_load_game(), once per game load, so the
+// placement always reflects the active core and the cfg at that moment. No
+// credentials, no other config keys -- everything else is still owned by
 // ra_load_credentials(). The three globals are reset to their hardcoded
 // defaults before parsing (same defaults as the static initializers), so a
 // core switch can't inherit stale values left over from the previous core's
@@ -2513,9 +2493,8 @@ void achievements_load_game(const char *rom_path, uint32_t crc32)
         if (!g_active_handler) return;
 
         // Popup placement is core-scoped (retroachievements.cfg: [SNES]/[N64]/...
-        // sections) but ra_load_credentials() only ran once at boot against
-        // whatever core was active then. Re-evaluate here, every load, against
-        // the core that's actually active now.
+        // sections). Re-evaluate here, every game load, against the core that's
+        // actually active now.
         ra_load_popup_settings();
 
         // Virtual Boy: the OSD offers auxiliary loads without the config-store
