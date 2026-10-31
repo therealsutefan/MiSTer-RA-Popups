@@ -4174,6 +4174,7 @@ void HandleUI(void)
 		else if (select && menusub == 3)
 		{
 			menusub = 0;
+			achievements_sound_scan();
 			menustate = MENU_RA_SETTINGS1;
 			break;
 		}
@@ -5860,7 +5861,7 @@ void HandleUI(void)
 	case MENU_RA_SETTINGS1:
 		OsdSetSize(16);
 		helptext_idx = 0;
-		menumask = 0x1FFF; // rows 0-11 (settings) + 12 (Back)
+		menumask = 0x3FFF; // rows 0-12 (settings) + 13 (Back)
 		parentstate = MENU_RA_SETTINGS1;
 		OsdSetTitle("RA Settings", OSD_ARROW_LEFT);
 
@@ -5885,23 +5886,32 @@ void HandleUI(void)
 		OsdWrite(9, s, menusub == 8);
 		sprintf(s, " V-Offset: %+d", achievements_get_popup_v_offset());
 		OsdWrite(10, s, menusub == 9);
+		{
+			const char *snd = achievements_get_sound();
+			int snd_len = strlen(snd);
+			if (snd_len > 4 && !strcasecmp(snd + snd_len - 4, ".wav")) snd_len -= 4;
+			if (!snd[0]) strcpy(s, " Sound: Default");
+			else if (!strcmp(snd, "off")) strcpy(s, " Sound: Off");
+			else snprintf(s, sizeof(s), " Sound: %.*s", snd_len < 21 ? snd_len : 21, snd); // 29 chars per OSD line
+			OsdWrite(11, s, menusub == 10);
+		}
 
-		OsdWrite(11, "");
 		OsdWrite(12, "             List");
 		sprintf(s, " List Description Ticker: %s", achievements_get_desc_ticker() ? "On" : "Off");
-		OsdWrite(13, s, menusub == 10);
+		OsdWrite(13, s, menusub == 11);
 		sprintf(s, " List Hotkey (Menu+Y): %s", achievements_get_list_hotkey() ? "On" : "Off");
-		OsdWrite(14, s, menusub == 11);
+		OsdWrite(14, s, menusub == 12);
 
-		OsdWrite(15, STD_EXIT, menusub == 12, 0, OSD_ARROW_LEFT);
+		OsdWrite(15, STD_EXIT, menusub == 13, 0, OSD_ARROW_LEFT);
 
 		menustate = MENU_RA_SETTINGS2;
 		break;
 
 	case MENU_RA_SETTINGS2:
-		if (menu || (select && menusub == 12))
+		if (menu || (select && menusub == 13))
 		{
 			achievements_flush_popup_offsets();
+			achievements_flush_sound();
 			menustate = MENU_MISC1;
 			menusub = 3;
 			break;
@@ -5933,6 +5943,23 @@ void HandleUI(void)
 			break;
 		}
 
+		// Sound: Default -> files -> Off, same live update + flush as the offsets.
+		// The preview plays nothing for Off.
+		if (menusub == 10 && (left || right))
+		{
+			int n = achievements_sound_count();
+			const char *cur = achievements_get_sound();
+			int pos = 0; // 0 = Default, 1..n = files, n+1 = Off
+			if (!strcmp(cur, "off")) pos = n + 1;
+			else for (int i = 0; i < n; i++) if (!strcasecmp(cur, achievements_sound_name(i))) pos = i + 1;
+			pos = (pos + (right ? 1 : n + 1)) % (n + 2);
+
+			achievements_set_sound_live(!pos ? "" : (pos > n) ? "off" : achievements_sound_name(pos - 1));
+			achievements_preview_sound();
+			menustate = MENU_RA_SETTINGS1;
+			break;
+		}
+
 		if (select)
 		{
 			switch (menusub)
@@ -5945,8 +5972,8 @@ void HandleUI(void)
 			case 5: achievements_set_lb_submission(!achievements_get_lb_submission()); break;
 			case 6: achievements_set_multiline_desc(!achievements_get_multiline_desc()); break;
 			case 7: achievements_set_popup_pos((achievements_get_popup_pos() + 1) % 3); break;
-			case 10: achievements_set_desc_ticker(!achievements_get_desc_ticker()); break;
-			case 11: achievements_set_list_hotkey(!achievements_get_list_hotkey()); break;
+			case 11: achievements_set_desc_ticker(!achievements_get_desc_ticker()); break;
+			case 12: achievements_set_list_hotkey(!achievements_get_list_hotkey()); break;
 			}
 			menustate = MENU_RA_SETTINGS1;
 			break;
@@ -5955,6 +5982,7 @@ void HandleUI(void)
 		if (left)
 		{
 			achievements_flush_popup_offsets();
+			achievements_flush_sound();
 			menustate = MENU_MISC1;
 			menusub = 3;
 		}
