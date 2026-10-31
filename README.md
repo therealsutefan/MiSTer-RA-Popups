@@ -372,6 +372,14 @@ All options live in `/media/fat/retroachievements.cfg`:
 | `watch` | - | Debug: comma-separated RA addresses to log on change |
 | `debug` | 0 | Verbose RA logging |
 
+### Achievement Sound
+
+`/media/fat/achievement.wav` stays the default unlock sound. To choose another one, copy files to `/media/fat/achievement_sounds/` and select them under **Sound** in RA Settings; left/right cycles Default, the files and Off, with a preview on each change. New files show up the next time you open RA Settings.
+
+- `.wav` files only; the first 64 in alphabetical order are listed.
+- Keep sounds to about 5 seconds; longer ones get cut off.
+- The choice is global and stored as `sound_file` in `retroachievements.cfg`: a filename without path, or `off` for no sound. If the file can't be read, the default plays.
+
 ## How to Try It
 
 1. Download the latest release binaries from the [Releases](https://github.com/odelot/Main_MiSTer/releases) page.
