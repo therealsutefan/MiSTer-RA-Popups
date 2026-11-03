@@ -193,6 +193,7 @@ static_assert(sizeof(vmode_custom_param_t) == sizeof(vmode_custom_t::item));
 
 // Static fwd decl
 static void video_fb_config();
+static void spd_config_update();
 static void video_calculate_cvt(int horiz_pixels, int vert_pixels, float refresh_rate, int reduced_blanking, vmode_custom_t *vmode);
 
 static vmode_custom_t v_cur = {}, v_def = {}, v_pal = {}, v_ntsc = {};
@@ -2686,6 +2687,10 @@ void video_init()
 
 void video_reinit()
 {
+	static uint8_t prev_edid[sizeof(edid)];
+	int prev_valid = is_edid_valid();
+	if (prev_valid) memcpy(prev_edid, edid, sizeof(edid));
+
 	int prev_ver = edid_version;
 	read_edid(true);
 
@@ -2694,6 +2699,22 @@ void video_reinit()
 	if (edid_version == prev_ver && is_edid_valid())
 	{
 		printf("*** Video re-init skipped: EDID unchanged.\n");
+		return;
+	}
+
+	// VRR excluded: its infoframes/timing are owned by set_vrr_mode() in the full path
+	bool vrr_active = use_vrr || use_freesync_spd || (last_vrr_mode != 0 && last_vrr_mode != 0xFF);
+
+	// same sink came back (HPD blip): the ADV7513 lost its config, but the scanout/fb don't need touching
+	if (!vrr_active && prev_valid && is_edid_valid() && !memcmp(prev_edid, edid, sizeof(edid)))
+	{
+		hdmi_config_init();
+		// re-init resets 0x17/0x3B/0x3C - re-apply, or video stays black
+		hdmi_invalidate_mode_cache();
+		hdmi_config_set_hdr();
+		hdmi_config_set_mode(&v_cur);
+		spd_config_update();
+		printf("*** Video re-init: EDID identical, HDMI config re-applied only.\n");
 		return;
 	}
 
